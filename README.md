@@ -20,6 +20,31 @@ built-in **How to Use** guide (per-page where applicable).
 
 ---
 
+## 📥 Download
+
+You can download the latest standalone Windows release here:
+👉 **[Download CyberOpsSuite (Windows)](https://github.com/LorinBuilds/CyberOpsSuite/releases/latest)**
+*(No Python installation is required to run the executable)*
+
+---
+
+## 📸 Screenshots
+
+Here is a quick overview of the modules available in CyberOpsSuite:
+
+| Module | Preview |
+| :--- | :--- |
+| **Dashboard** | ![Dashboard](screenshots/dashboard.png) |
+| **Firewall Manager** | ![Firewall](screenshots/firewall_manager.png) |
+| **Network Mapper** | ![Network Mapper](screenshots/network_mapper.png) |
+| **Server Monitor** | ![Server Monitor](screenshots/server_monitor.png) |
+| **VPN Manager** | ![VPN](screenshots/vpn_manager.png) |
+| **Event Log Analyzer** | ![Event Log](screenshots/event_log_analyzer.png) |
+| **DHCP Lease Viewer** | ![DHCP](screenshots/dhcp_lease_viewer.png) |
+| **IP Rotator** | ![IP Rotator](screenshots/ip_rotator.png) |
+
+---
+
 ## Modules
 
 | Module | Purpose | Platform |

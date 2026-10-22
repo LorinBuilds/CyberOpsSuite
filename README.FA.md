@@ -20,6 +20,31 @@ CyberOpsSuite هفت ابزار امنیتی مستقل رو زیر یه داش�
 
 ---
 
+## 📥 دانلود
+
+می‌تونید آخرین نسخه‌ی مستقل ویندوز رو از اینجا دانلود کنید:
+👉 **[دانلود CyberOpsSuite (ویندوز)](https://github.com/LorinBuilds/CyberOpsSuite/releases/latest)**
+*(برای اجرای فایل exe نیازی به نصب پایتون نیست)*
+
+---
+
+## 📸 اسکرین‌شات‌ها
+
+یه نمای کلی از ماژول‌های موجود در CyberOpsSuite:
+
+| ماژول | پیش‌نمایش |
+| :--- | :--- |
+| **داشبورد** | ![داشبورد](screenshots/dashboard.png) |
+| **مدیریت فایروال** | ![فایروال](screenshots/firewall_manager.png) |
+| **نقشه شبکه** | ![نقشه شبکه](screenshots/network_mapper.png) |
+| **مانیتور سرور** | ![مانیتور سرور](screenshots/server_monitor.png) |
+| **مدیریت VPN** | ![VPN](screenshots/vpn_manager.png) |
+| **آنالیزور لاگ** | ![آنالیزور لاگ](screenshots/event_log_analyzer.png) |
+| **نمایشگر DHCP** | ![DHCP](screenshots/dhcp_lease_viewer.png) |
+| **چرخش IP** | ![چرخش IP](screenshots/ip_rotator.png) |
+
+---
+
 ## ماژول‌ها
 
 | ماژول | کاربرد | سیستم‌عامل |
