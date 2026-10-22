@@ -39,11 +39,19 @@ def run_hidden(args, **kwargs) -> subprocess.CompletedProcess:
     kwargs.setdefault("capture_output", True)
     kwargs.setdefault("text", True)
     kwargs.setdefault("shell", False)
-    kwargs.update(get_no_window_kwargs())
+    
+    no_window = get_no_window_kwargs()
+    for key, value in no_window.items():
+        kwargs.setdefault(key, value)
+        
     return subprocess.run(args, **kwargs)
 
 
 def popen_hidden(args, **kwargs) -> subprocess.Popen:
     """Spawn a background process without a console window on Windows."""
-    kwargs.update(get_no_window_kwargs())
+    
+    no_window = get_no_window_kwargs()
+    for key, value in no_window.items():
+        kwargs.setdefault(key, value)
+        
     return subprocess.Popen(args, **kwargs)
