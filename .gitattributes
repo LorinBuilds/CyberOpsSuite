@@ -1,0 +1,22 @@
+# Auto detect text files and normalize to LF
+* text=auto
+
+# Shell scripts always LF (لینوکس)
+*.sh text eol=lf
+build_linux.sh text eol=lf
+
+# Python files LF
+*.py text eol=lf
+
+# Windows scripts CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files — don't touch
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.dat binary
+*.zip binary

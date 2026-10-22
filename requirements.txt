@@ -1,0 +1,23 @@
+﻿# CyberOpsSuite — Python dependencies
+#
+# Most functionality uses the Python standard library.
+# Only the GUI framework and the optional HTTP APIs need third-party packages.
+
+# ---- GUI ----
+customtkinter>=5.2.0
+
+# ---- Optional HTTP APIs (used by api/main.py in each module) ----
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# ---- Optional: Desktop notifications (Server Monitor) ----
+# pip install plyer
+plyer>=2.1.0
+
+# ---- Optional: Password-based SSH (DHCP Lease Viewer Linux backend) ----
+# pip install paramiko
+paramiko>=3.0.0
+
+# ---- Optional: Tor controller (IP Rotator) ----
+# pip install stem
+stem>=1.8.0

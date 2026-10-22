@@ -1,0 +1,85 @@
+{
+    "rules": [
+        {
+            "id": 1,
+            "action": "allow",
+            "ip": "any",
+            "port": 443,
+            "protocol": "TCP",
+            "direction": "outbound",
+            "enabled": true
+        },
+        {
+            "id": 2,
+            "action": "allow",
+            "ip": "any",
+            "port": 80,
+            "protocol": "TCP",
+            "direction": "outbound",
+            "enabled": true
+        },
+        {
+            "id": 3,
+            "action": "allow",
+            "ip": "any",
+            "port": 53,
+            "protocol": "UDP",
+            "direction": "outbound",
+            "enabled": true
+        },
+        {
+            "id": 4,
+            "action": "allow",
+            "ip": "any",
+            "port": 53,
+            "protocol": "TCP",
+            "direction": "outbound",
+            "enabled": true
+        },
+        {
+            "id": 5,
+            "action": "allow",
+            "ip": "any",
+            "port": 123,
+            "protocol": "UDP",
+            "direction": "outbound",
+            "enabled": true
+        },
+        {
+            "id": 6,
+            "action": "allow",
+            "ip": "any",
+            "port": 67,
+            "protocol": "UDP",
+            "direction": "outbound",
+            "enabled": true
+        },
+        {
+            "id": 7,
+            "action": "allow",
+            "ip": "any",
+            "port": 68,
+            "protocol": "UDP",
+            "direction": "inbound",
+            "enabled": true
+        },
+        {
+            "id": 8,
+            "action": "allow",
+            "ip": "any",
+            "port": 3389,
+            "protocol": "TCP",
+            "direction": "inbound",
+            "enabled": false
+        },
+        {
+            "id": 9,
+            "action": "allow",
+            "ip": "any",
+            "port": 445,
+            "protocol": "TCP",
+            "direction": "inbound",
+            "enabled": false
+        }
+    ]
+}
