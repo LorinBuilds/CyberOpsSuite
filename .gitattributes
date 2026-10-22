@@ -20,3 +20,6 @@ build_linux.sh text eol=lf
 *.dll binary
 *.dat binary
 *.zip binary
+
+*.sh text eol=lf
+build_linux.sh text eol=lf

@@ -62,3 +62,20 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python test artifacts
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
