@@ -95,3 +95,9 @@ htmlcov/
 # Crash logs (runtime hook writes these)
 # ==========================================
 *_crash.log
+
+# ==========================================
+# Local-only files
+# ==========================================
+clean.bat
+build.py
