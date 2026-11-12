@@ -55,15 +55,19 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
 # ==========================================
 # Build / Test extras
 # ==========================================
 *.spec
+installer.iss
 .pytest_cache/
 .coverage
 htmlcov/
 
+# ==========================================
 # Environment variables and secrets
+# ==========================================
 .env
 .env.*
 !.env.example
@@ -74,8 +78,20 @@ htmlcov/
 *.p12
 *.pfx
 
+# ==========================================
 # Python test artifacts
+# ==========================================
 .tox/
 .nox/
 .mypy_cache/
 .ruff_cache/
+
+# ==========================================
+# PyInstaller output
+# ==========================================
+# (build/ and dist/ already covered above)
+
+# ==========================================
+# Crash logs (runtime hook writes these)
+# ==========================================
+*_crash.log

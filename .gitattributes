@@ -1,25 +1,46 @@
+# ==========================================
 # Auto detect text files and normalize to LF
+# ==========================================
 * text=auto
 
-# Shell scripts always LF (لینوکس)
+# ==========================================
+# Shell scripts always LF (Linux)
+# ==========================================
 *.sh text eol=lf
-build_linux.sh text eol=lf
 
+# ==========================================
 # Python files LF
+# ==========================================
 *.py text eol=lf
 
+# ==========================================
+# Markdown and docs LF
+# ==========================================
+*.md text eol=lf
+LICENSE.txt text eol=lf
+README.md text eol=lf
+README.FA.md text eol=lf
+
+# ==========================================
 # Windows scripts CRLF
+# ==========================================
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# ==========================================
 # Binary files — don't touch
+# ==========================================
 *.png binary
 *.jpg binary
+*.jpeg binary
+*.gif binary
 *.ico binary
 *.exe binary
 *.dll binary
 *.dat binary
 *.zip binary
-
-*.sh text eol=lf
-build_linux.sh text eol=lf
+*.tar.gz binary
+*.rar binary
+*.pyd binary
+*.so binary
+*.dylib binary
