@@ -100,4 +100,3 @@ htmlcov/
 # Local-only files
 # ==========================================
 clean.bat
-build.py

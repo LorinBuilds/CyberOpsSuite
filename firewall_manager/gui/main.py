@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import os
 import platform
+import queue
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -27,13 +29,15 @@ from core.utils.icons import apply_window_icon
 from core.utils.paths import config_root_quiet
 from core.utils.subprocess_utils import get_no_window_kwargs
 
+from firewall_manager.core.firewall import FirewallManager
+from firewall_manager.core.app_discovery import AppEntry, discover_apps, scan_summary
+from firewall_manager.core.app_firewall import AppFirewall, is_admin
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from firewall_manager.core.firewall import FirewallManager
 
 
 # Dictionary of page-specific help texts
@@ -115,7 +119,21 @@ HELP_TEXTS = {
             "•  Keyboard shortcuts.\n"
             "•  Responsible use guidelines."
         )
-    }
+    },
+    "apps": {
+        "title": "My Apps",
+        "content": (
+            "Manage per-application network access:\n\n"
+            "•  Default (blue): no per-app rule (uses system firewall).\n"
+            "•  Allow (green): explicitly allow this app's traffic.\n"
+            "•  Block (red): block both inbound and outbound traffic.\n"
+            "•  Every change asks for a Yes / No confirmation first.\n"
+            "•  Search by name or path; 'All' / 'Apps only' switches the list.\n"
+            "•  ↻ Rescan after installing or removing programs.\n\n"
+            "Note: requires Administrator privileges on Windows.\n"
+            "More details: About page → My Apps."
+        )
+    },
 }
 
 
@@ -164,6 +182,9 @@ class FirewallGUI(ctk.CTk):
         self.scan_status: str = "Idle"
         self._firewall_rules: list = []
         self._system_rules: list = []
+        self._installed_apps: list[AppEntry] = []
+        self.app_fw = AppFirewall()
+        self._app_icon_cache: dict[str, object] = {}
 
     def _apply_dark_titlebar(self) -> None:
         if os.name != "nt":
@@ -210,6 +231,7 @@ class FirewallGUI(ctk.CTk):
             ("🛡️  Dashboard", "dashboard"),
             ("📄  Firewall Rules", "firewall"),
             ("⚙️  System Rules", "system"),
+            ("🖥️  My Apps", "apps"),
             ("🔐  Profile Modes", "modes"),
             ("🌐  Network Monitoring", "network"),
             ("🔧  Settings", "settings"),
@@ -254,7 +276,6 @@ class FirewallGUI(ctk.CTk):
         actions = ctk.CTkFrame(toolbar, fg_color="transparent")
         actions.grid(row=0, column=1, sticky="e", padx=(0, 20), pady=8)
 
-        # Only Help button here, About is in the sidebar
         self.help_btn = ctk.CTkButton(
             actions, text="❓ Help", width=100, height=34,
             corner_radius=Spacing.RADIUS_BUTTON,
@@ -268,8 +289,8 @@ class FirewallGUI(ctk.CTk):
         self.pages = {
             name: ctk.CTkFrame(self, fg_color=Colors.bg_alt)
             for name in (
-                "dashboard", "firewall", "system", "modes",
-                "network", "settings", "about",
+                "dashboard", "firewall", "system", "apps",
+                "modes", "network", "settings", "about",
             )
         }
         for page in self.pages.values():
@@ -278,6 +299,7 @@ class FirewallGUI(ctk.CTk):
         self.build_dashboard()
         self.build_firewall_page()
         self.build_system_page()
+        self.build_apps_page()
         self.build_modes_page()
         self.build_network_monitor_page()
         self.build_settings()
@@ -295,23 +317,84 @@ class FirewallGUI(ctk.CTk):
     # ---------------------------------------------------------- navigation
 
     def switch_page(self, name: str) -> None:
+        """Switch to a page and refresh only its data (non-blocking)."""
         for page in self.pages.values():
             page.grid_remove()
 
         self.pages[name].grid()
         self.current_page = name
         self._update_help_button()
-        self.refresh_current_page()
+
+        # Defer the refresh so the UI can paint first, then run in main loop
+        self.after(10, self._refresh_page_data_async)
+
+    def _refresh_page_data_async(self) -> None:
+        """Refresh only what the current page needs, without freezing UI."""
+        errors: list[str] = []
+
+        # quick_scan() shells out to netsh, so only run it on the page that
+        # actually shows its result (it used to run on EVERY page switch).
+        if self.current_page == "dashboard":
+            try:
+                scan = self.fw.quick_scan()
+                self.update_dashboard(scan)
+            except Exception as exc:
+                errors.append(f"Dashboard scan: {exc}")
+
+        if self.current_page == "firewall":
+            try:
+                self.load_rules()
+            except Exception as exc:
+                errors.append(f"Firewall rules: {exc}")
+
+        elif self.current_page == "system":
+            try:
+                self.load_system_rules()
+            except Exception as exc:
+                errors.append(f"System rules: {exc}")
+
+        elif self.current_page == "network" and hasattr(self, "monitor_tree"):
+            try:
+                self.update_network_monitor()
+            except Exception as exc:
+                errors.append(f"Network monitor: {exc}")
+
+        elif self.current_page == "apps":
+            if not self._apps_loaded and hasattr(self, "apps_list"):
+                self._load_apps_from_cache()
+
+        elif self.current_page == "dashboard":
+            try:
+                self.update_network_status()
+            except Exception as exc:
+                errors.append(f"Network status: {exc}")
+
+        self.last_scan_time = datetime.now().strftime("%H:%M:%S")
+        self.scan_status = "Completed with errors" if errors else "Completed"
+
+        if hasattr(self, "scan_info_label"):
+            self.scan_info_label.configure(
+                text=f"Last Scan: {self.last_scan_time} | Status: {self.scan_status}"
+            )
+
+        if errors:
+            self.log_application_event("Refresh warnings: " + " | ".join(errors))
+
+    def refresh_current_page(self) -> None:
+        """Manual refresh — same as async refresh but triggered by user."""
+        self.scan_status = "Scanning..."
+        if hasattr(self, "scan_info_label"):
+            self.scan_info_label.configure(text="Security Scan Running...")
+        self.update_idletasks()
+
+        self._refresh_page_data_async()
 
     def _update_help_button(self) -> None:
-        """Update the Help button text based on the current page."""
         if self.current_page == "about":
-            # Hide the Help button on the About page
             self.help_btn.pack_forget()
         else:
             page_title = HELP_TEXTS.get(self.current_page, {}).get("title", "this page")
             self.help_btn.configure(text=f"❓ Help: {page_title}")
-            # Show the Help button again if it was hidden
             self.help_btn.pack(side="right", padx=(0, 8))
 
     def open_about_shortcut(self, _event=None):
@@ -323,6 +406,7 @@ class FirewallGUI(ctk.CTk):
             "firewall": "firewall_search_entry",
             "system": "system_search_entry",
             "network": "monitor_search_entry",
+            "apps": "apps_search_entry",
         }
         attr = mapping.get(self.current_page)
         widget = getattr(self, attr, None) if attr else None
@@ -349,6 +433,7 @@ class FirewallGUI(ctk.CTk):
             "firewall": "firewall_search_var",
             "system": "system_search_var",
             "network": "monitor_search_var",
+            "apps": "apps_search_var",
         }
         var = getattr(self, mapping.get(self.current_page, ""), None)
         if var is not None and var.get():
@@ -359,6 +444,8 @@ class FirewallGUI(ctk.CTk):
                 self.apply_system_filters()
             elif self.current_page == "network":
                 self.apply_network_monitor_filter()
+            elif self.current_page == "apps":
+                self.render_apps_list()
         return "break"
 
     def enter_key_handler(self, _event=None):
@@ -367,57 +454,6 @@ class FirewallGUI(ctk.CTk):
     def delete_key_handler(self, _event=None):
         if self.current_page == "firewall":
             self.remove_rule()
-
-    def refresh_current_page(self) -> None:
-        errors: list[str] = []
-        self.scan_status = "Scanning..."
-
-        if hasattr(self, "scan_info_label"):
-            self.scan_info_label.configure(text="Security Scan Running...")
-        self.update_idletasks()
-
-        try:
-            scan = self.fw.quick_scan()
-            self.update_dashboard(scan)
-        except Exception as exc:
-            errors.append(f"Dashboard scan: {exc}")
-
-        try:
-            self.load_rules()
-        except Exception as exc:
-            errors.append(f"Firewall rules: {exc}")
-
-        try:
-            self.load_system_rules()
-        except Exception as exc:
-            errors.append(f"System firewall rules: {exc}")
-
-        try:
-            self.update_network_status()
-        except Exception as exc:
-            errors.append(f"Network status: {exc}")
-
-        if self.current_page == "network" and hasattr(self, "monitor_tree"):
-            try:
-                self.update_network_monitor()
-            except Exception as exc:
-                errors.append(f"Network monitor: {exc}")
-
-        self.last_scan_time = datetime.now().strftime("%H:%M:%S")
-        self.scan_status = "Completed with errors" if errors else "Completed"
-
-        if hasattr(self, "scan_info_label"):
-            self.scan_info_label.configure(
-                text=f"Last Scan: {self.last_scan_time} | Status: {self.scan_status}"
-            )
-
-        if errors:
-            self.log_application_event("Refresh warnings: " + " | ".join(errors))
-            messagebox.showerror(
-                "Refresh Warnings",
-                "Some information could not be refreshed. Details were saved "
-                "to exports/logs/firewall_manager.log.\n\n" + "\n".join(errors),
-            )
 
     # ------------------------------------------------------------ logging
 
@@ -873,6 +909,415 @@ class FirewallGUI(ctk.CTk):
             command=self.remove_selected_system_rule,
         ).pack(side="left", padx=4)
 
+    # --------------------------------------------------------------- apps page
+    #
+    # Performance design:
+    #   * nothing is loaded at start-up - the first visit loads the list;
+    #   * discovery / netsh run in a worker thread (UI never freezes);
+    #   * only APPS_PAGE_SIZE rows are built at a time ("Show more" appends);
+    #   * search is debounced; icons are loaded lazily and cached.
+
+    APPS_PAGE_SIZE = 40
+
+    def build_apps_page(self) -> None:
+        page = self.pages["apps"]
+        page.configure(fg_color=Colors.bg_alt)
+
+        self._build_page_title(
+            page, "My Applications", "apps_badge",
+            initial_text="● 0 apps",
+        )
+
+        bar = ctk.CTkFrame(
+            page, fg_color=Colors.surface,
+            corner_radius=Spacing.RADIUS_CARD,
+        )
+        bar.pack(fill="x", padx=16, pady=(0, 6))
+
+        self.apps_search_var = tk.StringVar()
+        entry = ctk.CTkEntry(
+            bar, textvariable=self.apps_search_var,
+            placeholder_text="Search installed applications...",
+            height=Spacing.INPUT_HEIGHT,
+            border_color=Colors.border_light,
+            fg_color=Colors.bg,
+        )
+        entry.pack(side="left", fill="x", expand=True, padx=(12, 8), pady=10)
+        entry.bind("<KeyRelease>", lambda _e: self._schedule_apps_render())
+        self.apps_search_entry = entry
+
+        self.apps_scope = ctk.CTkSegmentedButton(
+            bar, values=["All", "Apps only"],
+            command=lambda _v: self.render_apps_list(),
+            height=Spacing.INPUT_HEIGHT - 4,
+            selected_color=Colors.primary,
+            selected_hover_color=Colors.primary_hover,
+            unselected_color=Colors.surface_alt,
+            unselected_hover_color=Colors.border_light,
+            text_color=Colors.text_soft,
+        )
+        self.apps_scope.set("All")
+        self.apps_scope.pack(side="left", padx=(0, 10), pady=10)
+
+        self.apps_rescan_btn = ctk.CTkButton(
+            bar, text="↻ Rescan",
+            command=self.rescan_apps,
+            fg_color=Colors.primary, hover_color=Colors.primary_hover,
+            height=Spacing.INPUT_HEIGHT, width=110,
+        )
+        self.apps_rescan_btn.pack(side="left", padx=(0, 12), pady=10)
+
+        ctk.CTkButton(
+            bar, text="ℹ How it works",
+            command=lambda: self.switch_page("about"),
+            fg_color=Colors.info_bg, hover_color=Colors.info,
+            text_color=Colors.info_light,
+            height=Spacing.INPUT_HEIGHT, width=140,
+        ).pack(side="left", padx=(0, 12), pady=10)
+
+        self.apps_status = ctk.CTkLabel(
+            page, text="", anchor="w", justify="left",
+            font=Fonts.label(11), text_color=Colors.text_muted,
+        )
+        self.apps_status.pack(fill="x", padx=22, pady=(0, 6))
+
+        self.apps_list = ctk.CTkScrollableFrame(
+            page,
+            fg_color=Colors.surface,
+            corner_radius=Spacing.RADIUS_CARD,
+            scrollbar_button_color=Colors.surface_alt,
+            scrollbar_button_hover_color=Colors.border_light,
+        )
+        self.apps_list.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        self.apps_list.grid_columnconfigure(0, weight=1)
+
+        # state
+        self._apps_loaded = False
+        self._apps_busy = False
+        self._apps_filtered: list[AppEntry] = []
+        self._apps_shown = 0
+        self._apps_render_job = None
+        self._apps_more_btn = None
+        self._apps_inflight: set[str] = set()
+        self._apps_queue: queue.Queue = queue.Queue()
+
+        self._set_apps_status()
+        self.after(100, self._poll_apps_queue)
+
+    # ---- small helpers -------------------------------------------------
+
+    def _set_apps_status(self, text: str | None = None) -> None:
+        """Show a message under the toolbar (default: admin / OS warning)."""
+        if text is None:
+            if not self.app_fw.supported:
+                text = ("⚠ Per-application blocking is only available on "
+                        "Windows in this build — the list is read-only.")
+            elif not is_admin():
+                text = ("⚠ Not running as Administrator — changing a policy "
+                        "will fail. Restart the app with 'Run as administrator'.")
+            else:
+                text = ""
+            color = Colors.warning_text
+        else:
+            color = Colors.text_muted
+        self.apps_status.configure(text=text, text_color=color)
+
+    def _apps_bg(self, work, done) -> None:
+        """Run work() in a thread; done(result, error) runs on the Tk thread."""
+        def runner() -> None:
+            try:
+                result, error = work(), None
+            except Exception as exc:          # noqa: BLE001
+                result, error = None, exc
+            self._apps_queue.put((done, result, error))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _poll_apps_queue(self) -> None:
+        try:
+            while True:
+                done, result, error = self._apps_queue.get_nowait()
+                try:
+                    done(result, error)
+                except Exception as exc:      # noqa: BLE001
+                    self.log_application_event(f"My Apps callback failed: {exc}")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_apps_queue)
+
+    # ---- loading / scanning -------------------------------------------
+
+    def _load_apps_from_cache(self) -> None:
+        if self._apps_busy:
+            return
+        self._apps_busy = True
+        self.apps_badge.configure(text="● loading…")
+        self._set_apps_status(
+            "Loading applications… (the very first scan can take up to a minute)"
+        )
+        self._apps_bg(lambda: discover_apps(use_cache=True), self._on_apps_loaded)
+
+    def rescan_apps(self) -> None:
+        if self._apps_busy:
+            return
+        self._apps_busy = True
+        self.apps_rescan_btn.configure(state="disabled", text="Scanning…")
+        self.apps_badge.configure(text="● scanning…")
+        self._set_apps_status("Scanning installed applications…")
+        self._apps_bg(lambda: discover_apps(use_cache=False), self._on_apps_loaded)
+
+    def _on_apps_loaded(self, result, error) -> None:
+        self._apps_busy = False
+        self.apps_rescan_btn.configure(state="normal", text="↻ Rescan")
+        self._set_apps_status()
+
+        if error is not None:
+            self.log_application_event(f"App scan failed: {error}")
+            messagebox.showerror("Scan failed", str(error), parent=self)
+        else:
+            self._installed_apps = list(result)
+            self._apps_loaded = True
+        self.render_apps_list()
+
+        if error is None and not self._installed_apps:
+            detail = scan_summary()
+            self.log_application_event(f"App scan found nothing: {detail}")
+            self._set_apps_status(f"⚠ No applications found. {detail}")
+
+    # ---- rendering ------------------------------------------------------
+
+    def _schedule_apps_render(self) -> None:
+        """Debounce typing in the search box."""
+        if self._apps_render_job is not None:
+            self.after_cancel(self._apps_render_job)
+        self._apps_render_job = self.after(250, self.render_apps_list)
+
+    def render_apps_list(self) -> None:
+        if not hasattr(self, "apps_list"):
+            return
+        self._apps_render_job = None
+
+        query = self.apps_search_var.get().strip().casefold()
+        apps_only = self.apps_scope.get() == "Apps only"
+        self._apps_filtered = [
+            a for a in self._installed_apps
+            if (not apps_only or a.source != "folder")
+            and (not query
+                 or query in a.name.casefold()
+                 or query in a.executable.casefold())
+        ]
+
+        for child in self.apps_list.winfo_children():
+            child.destroy()
+        self._apps_more_btn = None
+        self._apps_shown = 0
+        try:
+            self.apps_list._parent_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+        self._append_app_rows()
+        self.apps_badge.configure(
+            text=f"● {len(self._apps_filtered)} / {len(self._installed_apps)} apps"
+        )
+
+    def _append_app_rows(self) -> None:
+        if self._apps_more_btn is not None:
+            self._apps_more_btn.destroy()
+            self._apps_more_btn = None
+
+        total = len(self._apps_filtered)
+        start = self._apps_shown
+        end = min(start + self.APPS_PAGE_SIZE, total)
+        for app in self._apps_filtered[start:end]:
+            self._build_app_row(self.apps_list, app)
+        self._apps_shown = end
+
+        if total == 0:
+            msg = ("No applications found. Press ↻ Rescan."
+                   if not self._installed_apps else "No application matches your search.")
+            ctk.CTkLabel(
+                self.apps_list, text=msg,
+                font=Fonts.label(12), text_color=Colors.text_muted,
+            ).pack(pady=30)
+        elif end < total:
+            self._apps_more_btn = ctk.CTkButton(
+                self.apps_list,
+                text=f"Show more ({total - end} left)",
+                command=self._append_app_rows,
+                fg_color=Colors.surface_alt, hover_color=Colors.border_light,
+                text_color=Colors.text_soft,
+                height=Spacing.INPUT_HEIGHT,
+            )
+            self._apps_more_btn.pack(pady=10)
+
+    def _build_app_row(self, parent, app: AppEntry) -> None:
+        row = ctk.CTkFrame(
+            parent, fg_color=Colors.bg,
+            corner_radius=Spacing.RADIUS_INPUT,
+            border_width=1, border_color=Colors.border,
+        )
+        row.pack(fill="x", padx=6, pady=4)
+        row.grid_columnconfigure(1, weight=1)
+
+        icon_label = self._make_icon_label(row, app)
+        icon_label.grid(row=0, column=0, rowspan=2, padx=(10, 10), pady=8)
+
+        ctk.CTkLabel(
+            row, text=app.name,
+            font=Fonts.label(13, bold=True),
+            text_color=Colors.text, anchor="w",
+        ).grid(row=0, column=1, sticky="ew", pady=(8, 0))
+
+        ctk.CTkLabel(
+            row, text=app.executable,
+            font=Fonts.mono(9),
+            text_color=Colors.text_muted, anchor="w",
+        ).grid(row=1, column=1, sticky="ew", pady=(0, 8))
+
+        seg = ctk.CTkSegmentedButton(
+            row,
+            values=["Default", "Allow", "Block"],
+            height=32,
+            selected_color=Colors.primary,
+            selected_hover_color=Colors.primary_hover,
+            unselected_color=Colors.surface_alt,
+            unselected_hover_color=Colors.border_light,
+            text_color=Colors.text_soft,
+        )
+        seg.configure(
+            command=lambda value, a=app, s=seg: self._on_app_policy_changed(a, value, s)
+        )
+        self._style_policy_seg(seg, app.policy)
+        seg.set(app.policy.capitalize())
+        if not self.app_fw.supported:
+            seg.configure(state="disabled")
+        seg.grid(row=0, column=2, rowspan=2, padx=12, pady=10, sticky="e")
+
+    def _get_app_icon(self, app: AppEntry):
+        """Load a 32x32 CTkImage once per app (None when unavailable)."""
+        if app.app_id in self._app_icon_cache:
+            return self._app_icon_cache[app.app_id]
+
+        image = None
+        if app.icon_path and Path(app.icon_path).is_file():
+            try:
+                from PIL import Image
+                with Image.open(app.icon_path) as raw:
+                    img = raw.convert("RGBA").resize((32, 32))
+                image = ctk.CTkImage(light_image=img, dark_image=img, size=(32, 32))
+            except Exception:
+                image = None
+        self._app_icon_cache[app.app_id] = image
+        return image
+
+    def _make_icon_label(self, parent, app: AppEntry):
+        image = self._get_app_icon(app)
+        if image is not None:
+            return ctk.CTkLabel(parent, image=image, text="", width=32, height=32)
+
+        initial = (app.name[:1] or "?").upper()
+        return ctk.CTkLabel(
+            parent, text=initial, width=32, height=32,
+            fg_color=Colors.primary,
+            text_color="#FFFFFF",
+            font=Fonts.label(14, bold=True),
+            corner_radius=6,
+        )
+
+    # ---- policy changes -------------------------------------------------
+
+    @staticmethod
+    def _widget_alive(widget) -> bool:
+        try:
+            return bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    def _style_policy_seg(self, seg, policy: str) -> None:
+        """Default = blue, Allow = green, Block = red."""
+        palette = {
+            "default": (Colors.primary, Colors.primary_hover),
+            "allow": (Colors.success, Colors.success_hover),
+            "block": (Colors.danger, Colors.danger_hover),
+        }
+        color, hover = palette.get(policy, palette["default"])
+        seg.configure(selected_color=color, selected_hover_color=hover)
+
+    def _confirm_policy_change(self, app: AppEntry, policy: str) -> bool:
+        if policy == "block":
+            text = (f"Block \"{app.name}\"?\n\n"
+                    "This application will lose ALL network access "
+                    "(inbound and outbound) until you change it back.")
+        elif policy == "allow":
+            text = (f"Allow \"{app.name}\"?\n\n"
+                    "A firewall rule will be added that explicitly allows this "
+                    "application's inbound and outbound traffic.")
+        else:
+            text = (f"Reset \"{app.name}\" to Default?\n\n"
+                    "The custom rule will be removed and the system firewall "
+                    "will decide again.")
+        return messagebox.askyesno(
+            "Confirm firewall change",
+            text + "\n\nDo you want to continue?",
+            icon="warning", parent=self,
+        )
+
+    def _on_app_policy_changed(self, app: AppEntry, label: str, seg=None) -> None:
+        policy = label.lower()
+        if policy == app.policy:
+            return
+
+        def revert_widget(to_policy: str) -> None:
+            if seg is not None and self._widget_alive(seg):
+                self._style_policy_seg(seg, to_policy)
+                seg.set(to_policy.capitalize())
+                seg.configure(state="normal")
+
+        if app.app_id in self._apps_inflight:         # previous change still running
+            revert_widget(app.policy)
+            return
+
+        # Yes / No warning before touching the firewall.
+        if not self._confirm_policy_change(app, policy):
+            revert_widget(app.policy)
+            return
+
+        old = app.policy
+        app.policy = policy
+        self._apps_inflight.add(app.app_id)
+        if seg is not None and self._widget_alive(seg):
+            self._style_policy_seg(seg, policy)
+            seg.configure(state="disabled")
+
+        def done(_result, error, app=app, old=old, seg=seg) -> None:
+            self._apps_inflight.discard(app.app_id)
+
+            if error is not None:
+                app.policy = old
+                self.log_application_event(
+                    f"App policy apply failed ({app.name}): {error}"
+                )
+                revert_widget(old)
+                messagebox.showerror(
+                    "Could not apply policy", f"{app.name}\n\n{error}", parent=self
+                )
+                return
+
+            if seg is not None and self._widget_alive(seg):
+                seg.configure(state="normal")
+            self.log_application_event(f"App policy set: {app.name} -> {policy}")
+            self._persist_app_policies()
+
+        self._apps_bg(lambda: self.app_fw.apply(app), done)
+
+    def _persist_app_policies(self) -> None:
+        try:
+            from firewall_manager.core.app_discovery import _save_cache
+            _save_cache(self._installed_apps)
+        except Exception as exc:
+            self.log_application_event(f"Persist app policies failed: {exc}")
+
     # ------------------------------------------------------ shared builders
 
     def _build_page_title(
@@ -1193,14 +1638,14 @@ class FirewallGUI(ctk.CTk):
 
         header = ctk.CTkFrame(page, fg_color="transparent")
         header.pack(fill="x", padx=18, pady=(18, 8))
-        
+
         legend = ctk.CTkFrame(page, fg_color="transparent")
         legend.pack(fill="x", padx=20, pady=(0, 8))
-        
+
         ctk.CTkLabel(
             legend, text="■ TCP", text_color="#3B82F6", font=Fonts.label(10)
         ).pack(side="left", padx=(0, 15))
-        
+
         ctk.CTkLabel(
             legend, text="■ UDP", text_color="#F59E0B", font=Fonts.label(10)
         ).pack(side="left")
@@ -1257,7 +1702,7 @@ class FirewallGUI(ctk.CTk):
         self.monitor_tree = self._build_treeview(
             table_frame, columns, headings, widths
         )
-        
+
         self.monitor_tree.tag_configure(
             "tcp", foreground="#3B82F6", background=Colors.surface
         )
@@ -1275,16 +1720,12 @@ class FirewallGUI(ctk.CTk):
     def update_network_monitor(self) -> None:
         if not hasattr(self, "monitor_tree"):
             return
-        
-        import sys
-        import platform
-        
-    
+
         if platform.system() == "Linux":
             cmd = ["ss", "-tulpn"]
         else:
             cmd = ["netstat", "-ano"]
-        
+
         try:
             result = subprocess.run(
                 cmd,
@@ -1292,7 +1733,7 @@ class FirewallGUI(ctk.CTk):
                 timeout=5, check=False,
                 **get_no_window_kwargs()
             )
-            
+
             if result.returncode != 0:
                 raise RuntimeError(
                     (result.stderr or f"{cmd[0]} returned a non-zero exit code").strip()
@@ -1303,17 +1744,15 @@ class FirewallGUI(ctk.CTk):
                 parts = raw_line.split()
                 if not parts:
                     continue
-                
-            
+
                 if platform.system() == "Linux":
-                
                     if parts[0] not in ("tcp", "udp"):
                         continue
                     proto = parts[0].upper()
                     local = parts[4] if len(parts) > 4 else "—"
                     remote = parts[5] if len(parts) > 5 else "—"
                     state = parts[1] if len(parts) > 1 else "—"
-                
+
                     pid = "—"
                     for p in parts:
                         if "pid=" in p:
@@ -1324,7 +1763,6 @@ class FirewallGUI(ctk.CTk):
                             break
                     rows.append((proto, local, remote, state, pid))
                 else:
-                    
                     if parts[0].upper() not in ("TCP", "UDP"):
                         continue
                     proto = parts[0].upper()
@@ -1488,6 +1926,35 @@ class FirewallGUI(ctk.CTk):
 
     # ------------------------------------------------------------ about page
 
+    def _about_card(self, parent, title: str, title_color, blocks) -> None:
+        """A titled About card made of (heading|None, text) blocks."""
+        card = ctk.CTkFrame(
+            parent, fg_color=Colors.surface,
+            corner_radius=Spacing.RADIUS_CARD,
+            border_width=1, border_color=Colors.border,
+        )
+        card.pack(fill="x", pady=(0, 16))
+
+        ctk.CTkLabel(
+            card, text=title,
+            font=Fonts.badge(11), text_color=title_color,
+        ).pack(anchor="w", padx=18, pady=(14, 6))
+
+        for heading, text in blocks:
+            if heading:
+                ctk.CTkLabel(
+                    card, text=heading,
+                    font=Fonts.label(11, bold=True), text_color=Colors.text_strong,
+                    anchor="w", justify="left",
+                ).pack(fill="x", padx=18, pady=(8, 2))
+            ctk.CTkLabel(
+                card, text=text,
+                font=Fonts.label(11), text_color=Colors.text,
+                justify="left", anchor="w", wraplength=760,
+            ).pack(fill="x", padx=18, pady=(0, 6))
+
+        ctk.CTkFrame(card, fg_color="transparent", height=8).pack()
+
     def build_about_page(self) -> None:
         page = self.pages["about"]
         page.configure(fg_color=Colors.bg)
@@ -1527,8 +1994,8 @@ class FirewallGUI(ctk.CTk):
 
         ctk.CTkLabel(
             hero,
-            text="A focused workspace for reviewing Windows Firewall rules,\n"
-                 "security profiles and current network connections.",
+            text="A focused workspace for managing Windows Firewall rules, security\n"
+                 "profiles, per-application network access and live connections.",
             font=Fonts.label(12), text_color=Colors.text_soft,
             justify="center",
         ).pack(pady=(0, 22))
@@ -1548,13 +2015,27 @@ class FirewallGUI(ctk.CTk):
             f"Platform:  {os_name}\n"
             f"Python:    {py_version}\n"
             f"Config:    {cfg_path}\n"
-            f"Rules:     {PROJECT_ROOT / 'exports' / 'json' / 'firewall_rules.json'}"
+            f"Rules:     {PROJECT_ROOT / 'exports' / 'json' / 'firewall_rules.json'}\n"
+            f"My Apps:   {Path(str(cfg_path)) / 'apps_cache.json'}"
         )
         ctk.CTkLabel(
             info_frame, text=info_text,
             font=Fonts.mono(10), text_color=Colors.text_soft,
             justify="left", anchor="w",
         ).pack(fill="x", padx=16, pady=12)
+
+        self._about_card(outer, "📑  PAGES OVERVIEW", Colors.info_light, [
+            (None,
+             "CyberOpsSuite Firewall Manager is a desktop front-end for the Windows "
+             "firewall (netsh advfirewall) with a read-only fallback on Linux."),
+            ("Dashboard", "Firewall status and live network status (IP, gateway, DNS, latency) at a glance."),
+            ("Firewall Rules", "Your own saved rules (stored in JSON). Add, edit, enable, disable, delete and apply them to the system."),
+            ("System Rules", "Every rule that exists in the system firewall; enable or disable them by name (admin required)."),
+            ("My Apps", "Decide per program whether it may use the network — see the dedicated section below."),
+            ("Profile Modes", "One-click profiles: Secure, Lockdown, Default and Custom."),
+            ("Network Monitoring", "Searchable snapshot of TCP/UDP connections (netstat on Windows, ss on Linux)."),
+            ("Settings", "Maintenance tools, logs/exports folders and the firewall reset."),
+        ])
 
         features = ctk.CTkFrame(
             outer, fg_color=Colors.surface,
@@ -1573,6 +2054,7 @@ class FirewallGUI(ctk.CTk):
             "• JSON-backed persistence with atomic write + backups\n"
             "• View every system firewall rule (read-only)\n"
             "• Enable/disable system rules by name (admin required)\n"
+            "• My Apps — allow / block individual programs (green / red), with icons, search and Yes/No confirmation\n"
             "• Profile modes: Secure, Lockdown, Default, Custom\n"
             "• Local netstat snapshot with search\n"
             "• Live network status (ping, IP, gateway, DNS, latency)\n"
@@ -1584,6 +2066,63 @@ class FirewallGUI(ctk.CTk):
             font=Fonts.label(11), text_color=Colors.text,
             justify="left", anchor="w", wraplength=760,
         ).pack(fill="x", padx=18, pady=(0, 14))
+
+        # -------------------------------------------------- My Apps section
+        self._about_card(outer, "🖥  MY APPS — PER-APPLICATION NETWORK CONTROL", Colors.info_light, [
+            (None,
+             "My Apps lets you decide, program by program, whether an application "
+             "is allowed to use the network. It writes normal Windows Firewall rules "
+             "for the program's .exe file — it does not replace the firewall."),
+            ("THE THREE STATES (EVERY CHANGE ASKS YES / NO FIRST)",
+             "•  Default (blue): no per-app rule; the system firewall decides as usual.\n"
+             "•  Allow (green): an explicit allow rule for inbound and outbound traffic.\n"
+             "•  Block (red): a block rule for inbound and outbound traffic.\n"
+             "•  Answering No changes nothing and the switch jumps back. "
+             "Going back to Default removes the app's rules."),
+            ("WHICH APPLICATIONS ARE LISTED",
+             "•  Start Menu shortcuts and the Windows registry (installed programs, "
+             "with their real names and icons).\n"
+             "•  A scan of the program folders (Program Files, Program Files (x86) and "
+             "%LOCALAPPDATA%\\Programs, 3 levels deep, up to 4000 executables) so "
+             "programs the first two sources miss still appear. Installers, "
+             "uninstallers and updaters are skipped.\n"
+             "•  'All' shows everything; 'Apps only' hides the crawled executables.\n"
+             "•  Microsoft Store (UWP) apps are not listed — they are not controlled "
+             "by program path. Programs installed on other drives appear only if the "
+             "Start Menu or registry knows them."),
+            ("USING THE PAGE",
+             "•  Type in the search box to filter by name or path.\n"
+             "•  The list shows 40 apps at a time — press 'Show more' for the rest.\n"
+             "•  ↻ Rescan refreshes the list after you install or remove programs. "
+             "Your Allow / Block choices are kept.\n"
+             "•  Scanning and applying run in the background, so the window stays responsive. "
+             "The first scan can take up to a minute.\n"
+             "•  If a scan finds nothing, the page explains why (shortcut count, "
+             "registry count, PowerShell error)."),
+            ("UNDER THE HOOD",
+             "•  Rules are named CyberOpsApp_<id>_in and CyberOpsApp_<id>_out and apply to all profiles.\n"
+             "•  Choices and icons are stored locally (apps_cache.json and app_icons, see Config above) "
+             "and survive restarts.\n"
+             "•  Applications that disappeared from the system but still have a rule stay in the "
+             "list so you can reset them to Default.\n"
+             "•  You can also see or delete the rules in wf.msc by searching for CyberOpsApp."),
+            ("LIMITS TO KNOW",
+             "•  A rule matches one exact .exe path. Copies in other folders, or a new "
+             "version installed to a new folder, are not covered — rescan and set the policy again.\n"
+             "•  A program that starts other executables (launchers, helper processes) "
+             "needs those blocked separately.\n"
+             "•  Windows lets Block rules win. An Allow rule will not override another "
+             "rule or Group Policy that blocks the same program.\n"
+             "•  It does not inspect packet contents; it only allows or blocks a program."),
+            ("REQUIREMENTS",
+             "•  Windows with Administrator rights — start the app with 'Run as administrator'. "
+             "Without them the page shows a warning and changes are refused.\n"
+             "•  On Linux the list is read-only and the switches are disabled (per-app blocking is not implemented there)."),
+            ("SAFETY",
+             "•  Blocking system programs or your browser can cut your connection. Start with "
+             "non-critical apps and check the connection after each change.\n"
+             "•  Use the Dashboard and Network Monitoring pages to verify the effect of a policy."),
+        ])
 
         platforms = ctk.CTkFrame(
             outer, fg_color=Colors.surface,
@@ -1689,7 +2228,7 @@ class FirewallGUI(ctk.CTk):
             "title": "Help",
             "content": "No help available for this page."
         })
-        
+
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"Help | {page_data['title']}")
         dialog.geometry("650x600")
@@ -2133,7 +2672,7 @@ class FirewallGUI(ctk.CTk):
             f"System rule '{name}' {'enabled' if enable else 'disabled'}.",
             parent=self,
         )
-        
+
         self.load_system_rules()
         self.update_dashboard(self.fw.quick_scan())
 
@@ -2264,11 +2803,11 @@ class FirewallGUI(ctk.CTk):
         item = self.tree.focus()
         if not item:
             return
-        
+
         values = self.tree.item(item)["values"]
         if not values:
             return
-            
+
         details = (
             f"Rule ID:   {values[0]}\n"
             f"Action:    {values[1]}\n"
@@ -2284,11 +2823,11 @@ class FirewallGUI(ctk.CTk):
         item = self.system_tree.focus()
         if not item:
             return
-        
+
         values = self.system_tree.item(item)["values"]
         if not values:
             return
-            
+
         details = (
             f"Rule Name: {values[0]}\n"
             f"Action:    {values[1]}\n"
@@ -2298,6 +2837,7 @@ class FirewallGUI(ctk.CTk):
             f"Status:    {values[5]}"
         )
         messagebox.showinfo("System Rule Details", details, parent=self)
+
 
 # ------------------------------------------------------------------ entry
 

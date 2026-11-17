@@ -293,7 +293,7 @@ class FirewallManager:
 
     def list_rules(self):
         return list(self.rules)
-    
+
     # ============================================================
     # Windows backend (netsh)
     # ============================================================
@@ -554,7 +554,6 @@ class FirewallManager:
             return
 
     def _linux_enable_system_rule(self, name: str) -> None:
-        # Linux has no direct equivalent of "named system rules" in ufw/nft.
         raise RuntimeError(
             "Enabling a named system rule is not supported on Linux. "
             "Use CyberOps rules instead."
@@ -573,11 +572,6 @@ class FirewallManager:
         )
 
     def _linux_get_system_rules(self) -> list[dict]:
-        """List rules for the detected backend (best-effort parse).
-
-        Returns a list of dicts with the same keys used on Windows:
-        name, action, port, protocol, direction, enabled.
-        """
         rules: list[dict] = []
         backend = self._linux_backend
 
@@ -585,7 +579,6 @@ class FirewallManager:
             if backend == "ufw":
                 out = self._run_linux(["status", "numbered"], check=False).stdout
                 for line in out.splitlines():
-                    # Format: "[ 1] 22/tcp    ALLOW IN   Anywhere"
                     if not line.startswith("["):
                         continue
                     try:
@@ -593,7 +586,6 @@ class FirewallManager:
                         parts = rest.split()
                         if len(parts) < 3:
                             continue
-                        # parts[0] = port/proto, parts[1] = action, parts[2] = direction
                         port_proto = parts[0]
                         action = parts[1].lower()
                         direction = parts[2].lower() if len(parts) > 2 else "in"
@@ -623,18 +615,15 @@ class FirewallManager:
                         continue
                     if line.startswith("chain"):
                         continue
-                    # Only look at lines that end with a verdict.
                     if "accept" in line or "drop" in line or "reject" in line:
                         counter += 1
                         action = "allow" if "accept" in line else "block"
-                        # Try to extract dport.
                         port = ""
                         proto = ""
                         if "dport" in line:
                             try:
                                 after = line.split("dport", 1)[1].split()
                                 port = after[0]
-                                # Look backwards for proto.
                                 before = line.split("dport", 1)[0].split()
                                 if before:
                                     proto = before[-1].upper()
@@ -662,11 +651,9 @@ class FirewallManager:
                     parts = line.split()
                     if len(parts) < 3 or not parts[0].isdigit():
                         continue
-                    # parts[0]=num, parts[1]=target, parts[2]=prot, ...
                     target = parts[1].upper()
                     proto = parts[2]
                     port = ""
-                    # Find dpt:443
                     for p in parts:
                         if p.startswith("dpt:"):
                             port = p[4:]
@@ -685,12 +672,6 @@ class FirewallManager:
         return rules
 
     def _linux_reset(self) -> bool:
-        """Reset CyberOps rules only; never touch system-wide defaults.
-
-        Note: a full OS-level reset (like ``netsh advfirewall reset``) is
-        not offered on Linux because it would wipe the user's entire
-        firewall configuration, which is almost never what they want.
-        """
         try:
             for rule in list(self.rules):
                 try:
@@ -702,11 +683,9 @@ class FirewallManager:
             return False
 
     def _linux_quick_scan(self) -> dict:
-        """Return a best-effort firewall snapshot on Linux."""
         rules = self._linux_get_system_rules()
         backend = self._linux_backend or "none"
 
-        # Try to detect firewall state.
         status = "Unknown"
         try:
             if backend == "ufw":
@@ -717,7 +696,6 @@ class FirewallManager:
                 status = "On" if out.strip() else "Off"
             elif backend == "iptables":
                 out = self._run_linux(["-L", "-n"], check=False).stdout
-                # Check if default policy is ACCEPT or DROP.
                 if "policy ACCEPT" in out and "policy DROP" not in out:
                     status = "On (permissive)"
                 elif "policy DROP" in out:
@@ -727,7 +705,6 @@ class FirewallManager:
         except Exception:
             status = "Unknown"
 
-        # Count open ports from parsed rules.
         open_ports: set[str] = set()
         for r in rules:
             if r.get("action") == "allow" and r.get("port"):
@@ -755,7 +732,6 @@ class FirewallManager:
     # ============================================================
 
     def apply_json_rule_to_system(self, rule: Rule) -> str:
-        """Apply a single rule to the OS (idempotent)."""
         if self._is_windows():
             return self._windows_apply_rule(rule)
         if self._is_linux():
@@ -785,7 +761,6 @@ class FirewallManager:
         rule_id = max((r.rule_id for r in self.rules), default=0) + 1
         rule = Rule(rule_id, action, ip, port, protocol, direction, True)
         self.validate_rule(rule)
-        # Apply first; persist only if the OS accepts the rule.
         self.apply_json_rule_to_system(rule)
         self.rules.append(rule)
         self.save()
@@ -796,7 +771,6 @@ class FirewallManager:
         if found is None:
             raise ValueError(f"No saved CyberOps rule with id {rule_id}.")
 
-        # Remove from the OS first.
         if self._is_windows():
             self._windows_delete_rule(found)
         elif self._is_linux():
@@ -824,8 +798,6 @@ class FirewallManager:
     def disable_rule(self, rule_id) -> None:
         self._set_enabled(rule_id, False)
 
-    # ------------------------------------------------- system rules
-
     def enable_system_rule(self, name: str) -> None:
         if self._is_windows():
             return self._windows_enable_system_rule(name)
@@ -837,11 +809,6 @@ class FirewallManager:
         return self._linux_disable_system_rule(name)
 
     def delete_system_rule(self, name: str) -> None:
-        """Delete a system rule by display name (admin required).
-
-        Previously missing; called by the GUI as
-        ``remove_selected_system_rule``.
-        """
         if self._is_windows():
             return self._windows_delete_system_rule(name)
         return self._linux_delete_system_rule(name)
@@ -856,20 +823,10 @@ class FirewallManager:
             return self._windows_get_system_rules()
         return self._linux_get_system_rules()
 
-    # ------------------------------------------------- profiles
-
     def custom_mode(self) -> dict:
         return self.apply_all_json_rules()
 
     def secure_mode(self) -> bool:
-        """Enable the firewall with a restrictive inbound policy.
-
-        On Windows: sets netsh profile to blockinbound,allowoutbound.
-        On Linux:
-          * ufw:    default deny incoming, allow outgoing, enable.
-          * nft:    adds a drop policy to the input chain.
-          * iptables: sets INPUT policy to DROP, OUTPUT to ACCEPT.
-        """
         if self._is_windows():
             self._windows_set_profile("blockinbound", "allowoutbound")
             return True
@@ -883,7 +840,6 @@ class FirewallManager:
                 return True
 
             if backend == "nft":
-                # Add a default drop policy to the input chain.
                 self._run_linux(
                     ["add", "rule", "inet", "filter", "input",
                      "policy", "drop"],
@@ -905,14 +861,6 @@ class FirewallManager:
         return False
 
     def lockdown_mode(self) -> bool:
-        """Block inbound and outbound traffic.
-
-        On Windows: netsh profile blockinbound,blockoutbound.
-        On Linux:
-          * ufw:    default deny incoming AND outgoing, enable.
-          * nft:    adds a drop policy to both input and output chains.
-          * iptables: sets both INPUT and OUTPUT policies to DROP.
-        """
         if self._is_windows():
             self._windows_set_profile("blockinbound", "blockoutbound")
             return True
@@ -951,22 +899,6 @@ class FirewallManager:
 
         return False
 
-    def lockdown_mode(self) -> bool:
-        if self._is_windows():
-            self._windows_set_profile("blockinbound", "blockoutbound")
-            return True
-        if self._is_linux():
-            if self._linux_backend == "ufw":
-                self._run_linux(["default", "deny", "incoming"], check=False)
-                self._run_linux(["default", "deny", "outgoing"], check=False)
-                self._run_linux(["enable"], check=False)
-                return True
-            raise RuntimeError(
-                "Lockdown Mode on Linux requires ufw. "
-                "Install ufw or configure nft/iptables manually."
-            )
-        return False
-
     def reset_firewall(self) -> bool:
         if self._is_windows():
             return self._windows_reset()
@@ -990,6 +922,4 @@ class FirewallManager:
             "open_ports": 0,
             "security_score": None,
         }
-        
-        
         
