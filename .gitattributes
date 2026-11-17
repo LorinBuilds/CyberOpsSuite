@@ -2,17 +2,14 @@
 # Auto detect text files and normalize to LF
 # ==========================================
 * text=auto
-
 # ==========================================
 # Shell scripts always LF (Linux)
 # ==========================================
 *.sh text eol=lf
-
 # ==========================================
 # Python files LF
 # ==========================================
 *.py text eol=lf
-
 # ==========================================
 # Markdown and docs LF
 # ==========================================
@@ -20,13 +17,11 @@
 LICENSE.txt text eol=lf
 README.md text eol=lf
 README.FA.md text eol=lf
-
 # ==========================================
 # Windows scripts CRLF
 # ==========================================
 *.bat text eol=crlf
 *.cmd text eol=crlf
-
 # ==========================================
 # Binary files — don't touch
 # ==========================================
@@ -35,7 +30,7 @@ README.FA.md text eol=lf
 *.jpeg binary
 *.gif binary
 *.ico binary
-*.exe binary
+*.exe filter=lfs diff=lfs merge=lfs -text
 *.dll binary
 *.dat binary
 *.zip binary
