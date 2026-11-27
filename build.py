@@ -2,14 +2,14 @@
 
 Creates:
   * dist/CyberOpsSuite/CyberOpsSuite.exe           - Dashboard launcher
-  * dist/CyberOpsSuite/modules/<Name>/<Name>.exe   - 7 standalone modules
+  * dist/CyberOpsSuite/modules/<Name>/<Name>.exe   - 8 standalone modules
   * dist/installer/CyberOpsSuite_Setup_<ver>.exe   - Windows installer (wizard)
 
 Usage::
 
     python build.py                    # build everything + installer
     python build.py dashboard          # dashboard only (modules are kept)
-    python build.py modules            # the 7 modules only
+    python build.py modules            # the 8 modules only
     python build.py --clean            # clean dist/ and build/ first
     python build.py --console          # debug build, shows a console window
     python build.py --no-admin         # do not request administrator rights
@@ -67,6 +67,7 @@ MODULES = [
     ("ServerMonitor", "server_monitor.gui.main", "Server Monitor"),
     ("VPNManager", "vpn_manager.gui.main", "VPN Manager"),
     ("IPRotator", "ip_rotator.gui.main", "IP Rotator"),
+    ("ThreatGuard", "threat_guard.gui.main", "Threat Guard"),   # ← افزوده شد
 ]
 
 
@@ -82,6 +83,7 @@ PROJECT_PACKAGES = [
     "server_monitor",
     "vpn_manager",
     "ip_rotator",
+    "threat_guard",          # ← افزوده شد
 ]
 
 THIRD_PARTY_PACKAGES = [
@@ -91,6 +93,11 @@ THIRD_PARTY_PACKAGES = [
     "PIL.ImageTk",
     "psutil",
     "numpy",
+    # در صورت نیاز ماژول ThreatGuard به کتابخانه‌های زیر، از کامنت خارج کنید:
+    # "yara",
+    # "clamd",
+    # "fastapi",
+    # "uvicorn",
 ]
 
 DATA_FOLDERS = ("assets", "bin", "data")

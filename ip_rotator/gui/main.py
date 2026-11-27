@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import tkinter as tk
 import threading
 from pathlib import Path
@@ -18,12 +19,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.theme import Colors, Fonts, Spacing
 from core.utils.icons import apply_window_icon
+try:
+    # Sets the CyberOpsSuite icon on dialogs too (CTkToplevel would otherwise
+    # replace it with the CustomTkinter logo after ~200 ms).
+    from core.utils.window_icons import apply_dialog_icon
+except Exception:  # pragma: no cover - older installs without the helper
+    apply_dialog_icon = apply_window_icon
 from ip_rotator.core.tor_controller import TorController
 from ip_rotator.core.ip_logger import IPLogger
 
 
 APP_NAME = "IP Rotator"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 APP_SUITE = "CyberOpsSuite"
 
 
@@ -41,13 +48,14 @@ class IPRotatorApp(ctk.CTk):
         self.minsize(700, 680)
         self.configure(fg_color=Colors.bg)
 
-        apply_window_icon(self)
+        apply_dialog_icon(self)
 
         self.tor = TorController()
         self.ip_logger = IPLogger()
         self._auto_rotate_after_id: str | None = None
         self.current_page = "main"
         self._about_open = False
+        self._busy = False
 
         self._build_ui()
 
@@ -111,8 +119,8 @@ class IPRotatorApp(ctk.CTk):
         ctk.CTkLabel(
             warning,
             text="This tool routes your browser's traffic through Tor to change your IP.\n"
-                 "You MUST configure your browser to use SOCKS5 proxy: 127.0.0.1:9050\n"
-                 "Ensure the Tor service is running and the 'stem' library is installed.",
+                 "You MUST configure your browser to use SOCKS5 proxy: 127.0.0.1:9050 (9150 for Tor Browser)\n"
+                 "Ensure Tor (or Tor Browser) is running. No extra Python packages are needed.",
             font=Fonts.label(11), text_color="#FED7AA",
             justify="left", anchor="w", wraplength=700,
         ).pack(fill="x", padx=15, pady=(0, 12))
@@ -211,7 +219,7 @@ class IPRotatorApp(ctk.CTk):
         )
         self.log_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
         self._log("Ready.")
-        self._log("Ensure Tor is running and 'stem' is installed.")
+        self._log("Ensure Tor (or Tor Browser) is running.")
 
         # --- Bottom Buttons (CSV) ---
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
@@ -237,7 +245,11 @@ class IPRotatorApp(ctk.CTk):
 
     def _apply_ip_display(self, real: str, tor: str) -> None:
         self.real_ip_label.configure(text=real)
-        self.tor_ip_label.configure(text=tor)
+        if tor.startswith("Error"):
+            self.tor_ip_label.configure(text="Tor not running", text_color=Colors.warning_text)
+            self._log(tor)
+        else:
+            self.tor_ip_label.configure(text=tor, text_color=Colors.success_text)
 
     def _log(self, message: str) -> None:
         if not hasattr(self, "log_text"):
@@ -247,24 +259,36 @@ class IPRotatorApp(ctk.CTk):
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _manual_change_ip(self) -> None:
+    def _manual_change_ip(self, notify: bool = True) -> None:
+        """Ask Tor for a new identity without freezing the window."""
+        if self._busy:
+            return
+        self._busy = True
+        self.manual_btn.configure(state="disabled")
         self._log("Requesting new Tor identity...")
-        success, msg = self.tor.change_identity()
-        self._log(msg)
-        
-        if success:
-            self.after(2000, self._capture_new_ip)
 
-    def _capture_new_ip(self) -> None:
-        """Fetch and log the new IP."""
-        self._log("Fetching new IP address...")
-        new_ip = self.ip_logger.log_current_ip()
-        
+        def worker() -> None:
+            success, msg = self.tor.change_identity()
+            new_ip = None
+            if success:
+                time.sleep(3)  # give Tor a moment to build the new circuit
+                new_ip = self.ip_logger.log_current_ip()
+            self.after(0, lambda: self._finish_change(success, msg, new_ip, notify))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_change(self, success: bool, msg: str, new_ip: str | None, notify: bool) -> None:
+        self._busy = False
+        self.manual_btn.configure(state="normal")
+        self._log(msg)
+        if not success or new_ip is None:
+            return
         if new_ip.startswith("Error"):
             self._log(f"Failed to get IP: {new_ip}")
-        else:
-            self._log(f"✅ New IP Logged: {new_ip}")
-            self.tor_ip_label.configure(text=new_ip)
+            return
+        self._log(f"✅ New IP Logged: {new_ip}")
+        self.tor_ip_label.configure(text=new_ip, text_color=Colors.success_text)
+        if notify:
             messagebox.showinfo(
                 "Success",
                 f"New IP: {new_ip}\nSaved to history.",
@@ -309,7 +333,7 @@ class IPRotatorApp(ctk.CTk):
         if not self.auto_var.get():
             return
         self._log(f"Auto-Rotate triggered ({self.timer_var.get()}).")
-        self._manual_change_ip()
+        self._manual_change_ip(notify=False)
         self._schedule_auto()
 
     # ------------------------------------------------------------- How to Use
@@ -322,9 +346,9 @@ class IPRotatorApp(ctk.CTk):
         dialog.minsize(600, 600)
         dialog.configure(fg_color=Colors.bg)
         dialog.transient(self)
-        dialog.grab_set()
+        dialog.after(60, lambda d=dialog: d.winfo_exists() and d.grab_set())
 
-        apply_window_icon(dialog)
+        apply_dialog_icon(dialog)
 
         outer = ctk.CTkScrollableFrame(
             dialog, fg_color=Colors.surface,
@@ -351,10 +375,11 @@ class IPRotatorApp(ctk.CTk):
             "1️⃣  REQUIREMENTS\n"
             "•  Tor must be installed and running.\n"
             "•  ControlPort must be enabled (9151 for Tor Browser, 9051 for Tor Expert Bundle).\n"
-            "•  The 'stem' library must be installed:\n"
-            "   pip install stem\n\n"
+            "   The tool detects the right port automatically.\n"
+            "•  No extra Python package is required (the 'stem' library is optional).\n\n"
             "2️⃣  BROWSER & NETWORK CONFIGURATION\n"
             "•  Configure your browser to use SOCKS5 proxy: 127.0.0.1:9050\n"
+            "   (127.0.0.1:9150 when you use Tor Browser)\n"
             "•  This is required for your browser traffic to go through Tor.\n"
             "•  VPN may be required: In some regions, Tor is blocked by ISPs.\n"
             "   If you cannot connect, try using a VPN first.\n\n"
@@ -405,9 +430,9 @@ class IPRotatorApp(ctk.CTk):
         dialog.geometry("700x700")
         dialog.configure(fg_color=Colors.bg)
         dialog.transient(self)
-        dialog.grab_set()
+        dialog.after(60, lambda d=dialog: d.winfo_exists() and d.grab_set())
 
-        apply_window_icon(dialog)
+        apply_dialog_icon(dialog)
 
         # Restore Help button whether the dialog is closed via button, Esc or X
         def on_close():
@@ -473,12 +498,9 @@ class IPRotatorApp(ctk.CTk):
             "1. Install and run Tor (or Tor Browser).\n"
             "2. Ensure Tor is running with ControlPort enabled\n"
             "   (9151 for Tor Browser, 9051 for Tor Expert Bundle).\n"
-            "3. Install the required library:\n"
-            "   Windows: pip install stem\n"
-            "   Linux:   sudo apt install python3-stem\n"
-            "4. Configure your browser's SOCKS5 proxy to 127.0.0.1:9050.\n"
-            "5. If Tor is blocked in your region, try using a VPN first.\n"
-            "6. Use this tool to request new IPs.",
+            "3. Configure your browser's SOCKS5 proxy to 127.0.0.1:9050 (9150 for Tor Browser).\n"
+            "4. If Tor is blocked in your region, try using a VPN first.\n"
+            "5. Use this tool to request new IPs.",
             Colors.info,
         )
 

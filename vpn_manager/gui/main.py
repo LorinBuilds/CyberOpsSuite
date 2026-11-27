@@ -50,13 +50,13 @@ DEFAULT_HTTP_PORT = DEFAULT_SOCKS_PORT + 1
 LOG_REFRESH_MS = 2_000
 
 #: Status refresh interval (ms) while connected.
-STATUS_REFRESH_MS = 3_000
+STATUS_REFRESH_MS = 15_000
 
 #: Speed test interval (ms) while connected.
-SPEED_REFRESH_MS = 10_000
+SPEED_REFRESH_MS = 300_000
 
 #: Speed test duration (seconds).
-SPEED_DURATION = 5.0
+SPEED_DURATION = 3.0
 
 #: Ping thresholds (ms).
 PING_GOOD_MS = 100
@@ -94,6 +94,9 @@ class VPNManagerApp(ctk.CTk):
 
         # State.
         self.selected: str | None = None
+        self._fail_streak = 0
+        self._sites_testing = False
+        self.active_id: str | None = None   # profile Xray is really running
         self._loading: bool = False
         self._ping_results: dict[str, float | None] = {}
         self._ping_in_progress = False
@@ -301,6 +304,67 @@ class VPNManagerApp(ctk.CTk):
         self.connect_btn = ctk.CTkButton(footer, text="▶  Connect", width=130, height=34, fg_color=Colors.success, hover_color=Colors.success_hover, font=Fonts.label(10, bold=True), command=self._connect)
         self.connect_btn.grid(row=0, column=3, sticky="e", padx=(6, 0))
 
+        self.sysproxy_var = tk.BooleanVar(value=True)
+        self.manager.use_system_proxy = True
+        ctk.CTkSwitch(footer, text="Set system proxy (browser & most apps)", variable=self.sysproxy_var, font=Fonts.label(10), command=self._toggle_sysproxy).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.sites_btn = ctk.CTkButton(footer, text="🌐  Test sites", width=140, height=30, fg_color=Colors.neutral_dark, hover_color=Colors.neutral_dark_hover, font=Fonts.label(10), command=self._test_sites)
+        self.sites_btn.grid(row=1, column=1, columnspan=3, sticky="e", padx=(6, 0), pady=(8, 0))
+
+    # ----------------------------------------------------------- site test
+
+    def _test_sites(self) -> None:
+        """Open YouTube / Instagram / X / Telegram through every profile."""
+        if self._sites_testing or not self.manager.profiles:
+            return
+        self._sites_testing = True
+        self.sites_btn.configure(state="disabled", text="Testing…")
+        self.info_var.set("Testing YouTube / Instagram / X / Telegram through every profile… (up to a minute)")
+        profiles = list(self.manager.profiles)
+        path = self.xray_path
+
+        def worker():
+            try: res = self.manager.test_all_profiles(profiles, path, jobs=4)
+            except Exception as exc: res = exc
+            self._results.put((self._show_site_results, (res,)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_site_results(self, res) -> None:
+        self._sites_testing = False
+        self.sites_btn.configure(state="normal", text="🌐  Test sites")
+        if isinstance(res, Exception):
+            self.info_var.set(f"Site test failed: {res}")
+            return
+        best = next((r for r in res if r["sites"] and any(v.get("ok") for v in r["sites"].values())), None)
+        if best:
+            self.selected = best["id"]
+            try: self.tree.selection_set(best["id"])
+            except tk.TclError: pass
+            self.info_var.set(f"Best profile: {best['name']} (selected). Press Connect.")
+        else:
+            self.info_var.set("No profile could open the test sites — see the report.")
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Site test | VPN Manager")
+        dialog.geometry("1000x520")
+        dialog.transient(self)
+        box = ctk.CTkTextbox(dialog, font=Fonts.mono(10), wrap="none")
+        box.pack(fill="both", expand=True, padx=12, pady=12)
+        box.insert("1.0", "Best first.  ✓ all sites   ~ some sites   ✗ none\n\n" + self.manager.format_site_results(res))
+        box.configure(state="disabled")
+
+    def _toggle_sysproxy(self) -> None:
+        on = bool(self.sysproxy_var.get())
+        self.manager.use_system_proxy = on
+        if self.manager.connected():
+            if on:
+                if not self.manager.set_system_proxy():
+                    self.info_var.set(self.manager.sysproxy_error)
+                else:
+                    self.info_var.set("System proxy enabled.")
+            else:
+                self.manager.clear_system_proxy()
+                self.info_var.set("System proxy disabled.")
+
     # ------------------------------------------------------------- How to Use
 
     def _show_how_to_use(self):
@@ -355,7 +419,10 @@ class VPNManagerApp(ctk.CTk):
             "4️⃣  LOCAL PROXY\n"
             "•  SOCKS5: 127.0.0.1:10808\n"
             "•  HTTP:   127.0.0.1:10809\n"
-            "•  Point your browser/app at these endpoints.\n\n"
+            "•  'Set system proxy' (on by default) points Windows/GNOME at the\n"
+            "   HTTP port, so browsers and most apps work automatically.\n"
+            "•  Telegram and some apps ignore it: set SOCKS5 127.0.0.1:10808\n"
+            "   in their own proxy settings.\n\n"
             "5️⃣  SMART AUTO-SWITCH\n"
             "•  Enable the 'Auto-Rotate' switch.\n"
             "•  Choose an interval (1, 2, 5, 10 min).\n"
@@ -490,8 +557,9 @@ class VPNManagerApp(ctk.CTk):
                 self._results.put((self._finish_switch, ()))
                 return
             best_id = min(valid_pings, key=valid_pings.get)
-            force = pings.get(self.selected) is None
-            should_switch = force or (best_id != self.selected and valid_pings[best_id] < pings[self.selected] * 0.8)
+            cur = self.active_id or self.selected
+            force = pings.get(cur) is None
+            should_switch = force or (best_id != cur and valid_pings[best_id] < pings[cur] * 0.8)
             if should_switch: self._results.put((self._do_smart_switch, (force, best_id)))
             else: self._results.put((self._finish_switch, ()))
 
@@ -499,17 +567,30 @@ class VPNManagerApp(ctk.CTk):
 
     def _do_smart_switch(self, force: bool, best_id: str = None):
         if best_id is None and self.manager.profiles:
-            idx = next((i for i, p in enumerate(self.manager.profiles) if p["id"] == self.selected), 0)
+            cur = self.active_id or self.selected
+            idx = next((i for i, p in enumerate(self.manager.profiles) if p["id"] == cur), 0)
             best_id = self.manager.profiles[(idx + 1) % len(self.manager.profiles)]["id"]
-        if best_id:
-            target = next((p for p in self.manager.profiles if p["id"] == best_id), None)
-            if target:
-                self.selected = best_id
-                self.tree.selection_set(best_id)
-                try:
-                    self.manager.connect(target, self.xray_path)
-                    self.info_var.set(f"Auto-Switched to {target['name']}")
-                except Exception as exc: self.info_var.set(f"Auto-Switch failed: {exc}")
+        target = next((p for p in self.manager.profiles if p["id"] == best_id), None) if best_id else None
+        if not target:
+            self._finish_switch()
+            return
+        self.selected = best_id
+        self.tree.selection_set(best_id)
+        self.info_var.set(f"Auto-switching to {target['name']}…")
+
+        def worker():
+            try:
+                self.manager.connect(target, self.xray_path)
+                self.active_id = target["id"]
+                msg = f"Auto-Switched to {target['name']}"
+            except Exception as exc:
+                msg = f"Auto-Switch failed: {exc}"
+            self._results.put((self._after_switch, (msg,)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_switch(self, msg: str) -> None:
+        self.info_var.set(msg)
         self._finish_switch()
 
     def _finish_switch(self):
@@ -633,6 +714,7 @@ class VPNManagerApp(ctk.CTk):
             return
         if self._loading: return
         self._stop_live_status()
+        self._fail_streak = 0
         self.status_var.set("●  CONNECTING…")
         self.sidebar_status.configure(text_color=Colors.warning_text)
         self.info_var.set(f"Connecting to {profile['name']}…")
@@ -641,7 +723,9 @@ class VPNManagerApp(ctk.CTk):
         self._set_busy(True, None)
 
         def worker():
-            try: self.manager.connect(profile, self.xray_path)
+            try:
+                self.manager.connect(profile, self.xray_path)
+                self.active_id = profile["id"]
             except VPNError as exc:
                 self._results.put((self._apply_connect_error, (str(exc),)))
                 return
@@ -656,13 +740,15 @@ class VPNManagerApp(ctk.CTk):
 
     def _apply_connect_ok(self, name: str, verified: bool, message: str) -> None:
         self._set_busy(False, None)
+        if self.manager.sysproxy_error:
+            message = f"{message}  [{self.manager.sysproxy_error}]"
         if verified:
             self.status_var.set("●  CONNECTED (verified)")
             self.sidebar_status.configure(text_color=Colors.success_text)
             self.info_var.set(f"{name} — {message}")
             self._start_live_status()
         else:
-            self.status_var.set("●  CONNECTED (unverified)")
+            self.status_var.set("●  PROXY STARTED (tunnel NOT verified)")
             self.sidebar_status.configure(text_color=Colors.warning_text)
             self.info_var.set(f"{name} — {message}")
             self._start_live_status()
@@ -675,6 +761,7 @@ class VPNManagerApp(ctk.CTk):
 
     def _disconnect(self) -> None:
         self._stop_live_status()
+        self.active_id = None
         try: self.manager.disconnect()
         except Exception as exc:
             messagebox.showerror("Disconnect failed", str(exc), parent=self)
@@ -702,7 +789,14 @@ class VPNManagerApp(ctk.CTk):
 
     def _tick_status(self) -> None:
         self._status_after_id = None
-        if not self.manager.connected(): return
+        if not self.manager.connected():
+            # Xray died on its own: tell the user instead of staying "CONNECTED".
+            self.active_id = None
+            self.status_var.set("●  DISCONNECTED (Xray stopped)")
+            self.sidebar_status.configure(text_color=Colors.danger_text)
+            self.info_var.set("Xray process exited unexpectedly — see the log panel.")
+            self._stop_live_status()
+            return
         if self._verifying:
             self._status_after_id = self.after(STATUS_REFRESH_MS, self._tick_status)
             return
@@ -717,7 +811,10 @@ class VPNManagerApp(ctk.CTk):
 
     def _apply_live_status(self, ok: bool, message: str) -> None:
         self._verifying = False
-        if ok:
+        self._fail_streak = 0 if ok else self._fail_streak + 1
+        if not ok and self._fail_streak < 2:
+            self.info_var.set(f"Re-checking… ({message})")
+        elif ok:
             self.status_var.set("●  CONNECTED")
             self.sidebar_status.configure(text_color=Colors.success_text)
             self.info_var.set(message)
@@ -726,7 +823,7 @@ class VPNManagerApp(ctk.CTk):
             self.sidebar_status.configure(text_color=Colors.danger_text)
             self.info_var.set(message)
         if self.manager.connected():
-            self._status_after_id = self.after(STATUS_REFRESH_MS, self._tick_status)
+            self._status_after_id = self.after(STATUS_REFRESH_MS if ok else 3_000, self._tick_status)
 
     def _tick_speed(self) -> None:
         self._speed_after_id = None

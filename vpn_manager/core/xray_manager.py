@@ -41,8 +41,26 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from core.utils.paths import config_root
-from core.utils.subprocess_utils import get_no_window_kwargs
+import signal
+import ssl
+
+try:  # Inside the full CyberOpsSuite project.
+    from core.utils.paths import config_root
+    from core.utils.subprocess_utils import get_no_window_kwargs
+except ImportError:  # Standalone fallback so CLI/API still work.
+    def config_root(app_name: str) -> Path:
+        if os.name == "nt":
+            base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        path = base / "CyberOpsSuite" / app_name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_no_window_kwargs() -> dict:
+        if os.name == "nt":
+            return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+        return {}
 
 
 # ---------------------------------------------------------------- paths
@@ -57,8 +75,23 @@ TRACE_HOST = "1.1.1.1"
 TRACE_PORT = 80
 TRACE_PATH = "/cdn-cgi/trace"
 
-#: Speed-test endpoints (HTTP, no TLS — approximate but fast).
+#: Lightweight "is the tunnel alive" checks (HTTPS, tried in order).
+CHECK_URLS = (
+    ("cp.cloudflare.com", "/generate_204"),
+    ("www.gstatic.com", "/generate_204"),
+)
+
+#: Sites the per-profile tester opens through the tunnel.
+SITE_TESTS = (
+    ("YouTube", "www.youtube.com", "/generate_204"),
+    ("Instagram", "www.instagram.com", "/"),
+    ("X", "x.com", "/"),
+    ("Telegram", "web.telegram.org", "/"),
+)
+
+#: Speed-test endpoints (HTTPS through the SOCKS tunnel).
 SPEED_HOST = "speed.cloudflare.com"
+SPEED_PORT = 443
 SPEED_DOWN_PATH = "/__down?bytes=10000000"
 SPEED_UP_PATH = "/__up"
 
@@ -105,6 +138,13 @@ class XrayManager:
         self.profiles_file = self.base_dir / "profiles.json"
         self.config_file = self.base_dir / "active_config.json"
         self.log_file = self.base_dir / "xray.log"
+        self.pid_file = self.base_dir / "xray.pid"
+        self.local_port: int = DEFAULT_SOCKS_PORT
+        self.sysproxy_file = self.base_dir / "sysproxy.json"
+        #: When True, connect() points the OS proxy at Xray's HTTP port.
+        self.use_system_proxy: bool = False
+        self.sysproxy_error: str = ""
+        self._tls_context: ssl.SSLContext | None = None  # test hook
 
         self.process: subprocess.Popen | None = None
         self._lock = threading.Lock()
@@ -112,6 +152,7 @@ class XrayManager:
 
         atexit.register(self._atexit_cleanup)
         self._kill_orphans()
+        self.clear_system_proxy()  # undo a proxy left by a crashed run
 
     # -------------------------------------------------------- lifecycle
 
@@ -121,29 +162,47 @@ class XrayManager:
         except Exception:
             pass
 
-    def _kill_orphans(self) -> None:
-        """Kill any orphaned Xray processes from a previous crash.
-
-        Windows uses ``taskkill``; Linux uses ``pkill``. macOS is not
-        supported by CyberOpsSuite.
-        """
+    def _pid_is_xray(self, pid: int) -> bool:
+        """True only if *pid* is alive and really is an Xray process."""
         try:
             if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/F", "/IM", "xray.exe"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
+                out = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, check=False,
                     **get_no_window_kwargs()
-                )
-            else:
-                subprocess.run(
-                    ["pkill", "-f", "/xray"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
+                ).stdout.lower()
+                return "xray" in out
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().lower()
+            return b"xray" in cmd
         except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _kill_orphans(self) -> None:
+        """Kill the Xray process left behind by OUR previous run (pid file).
+
+        The old version killed every ``xray.exe`` / anything matching
+        ``/xray`` on the machine, which also killed other apps (v2rayN,
+        Nekoray, ...). Now only the PID we started ourselves is touched.
+        """
+        try:
+            pid = int(self.pid_file.read_text().strip())
+        except (OSError, ValueError):
+            return
+        try:
+            if self._pid_is_xray(pid):
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False, **get_no_window_kwargs()
+                    )
+                else:
+                    os.kill(pid, signal.SIGTERM)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            self.pid_file.unlink()
+        except OSError:
             pass
 
     # --------------------------------------------------------- profiles
@@ -321,8 +380,17 @@ class XrayManager:
 
         elif network == "grpc":
             stream["grpcSettings"] = {
-                "serviceName": p.get("serviceName") or p.get("service_name", ""),
+                # VMess share links keep the gRPC service name in "path".
+                "serviceName": (
+                    p.get("serviceName") or p.get("service_name") or p.get("path", "")
+                ),
             }
+
+        elif network == "httpupgrade":
+            hu: dict[str, Any] = {"path": p.get("path", "/") or "/"}
+            if p.get("host"):
+                hu["host"] = p["host"]
+            stream["httpupgradeSettings"] = hu
 
         elif network in ("xhttp", "splithttp"):
             xhttp: dict[str, Any] = {
@@ -342,7 +410,7 @@ class XrayManager:
             stream["network"] = "xhttp"
 
         # ---------------- TLS layer ----------------
-        if security == "tls" or p.get("sni"):
+        if security == "tls":
             tls: dict[str, Any] = {
                 "serverName": (
                     p.get("sni")
@@ -356,6 +424,11 @@ class XrayManager:
             alpn = p.get("alpn")
             if alpn:
                 tls["alpn"] = [x.strip() for x in alpn.split(",")]
+            # Certificate pin from the link (pcs / pinSHA256): lets servers
+            # with a self-signed cert work without allowInsecure.
+            pin = (p.get("pcs") or p.get("pinSHA256") or "").replace(":", "").strip().lower()
+            if pin:
+                tls["pinnedPeerCertSha256"] = [x for x in pin.split(",") if x]
             stream["tlsSettings"] = tls
 
         # ---------------- Reality layer ----------------
@@ -388,18 +461,11 @@ class XrayManager:
 
         user: dict[str, Any] = {"id": profile["uuid"]}
         if protocol == "vless":
-            user["encryption"] = "none"
-            # Vision flow is only required (and only safe) for VLESS +
-            # Reality over TCP. For xhttp/ws/grpc + Reality, adding it
-            # breaks the handshake on many servers.
-            network = params.get("type") or params.get("network") or "tcp"
+            # Use the link's own encryption (VLESS "mlkem768x25519plus..."
+            # post-quantum encryption) and flow. Never invent a flow: if the
+            # link has none, the server has none, and forcing Vision breaks it.
+            user["encryption"] = params.get("encryption") or "none"
             flow = params.get("flow")
-            if (
-                not flow
-                and params.get("security") == "reality"
-                and network == "tcp"
-            ):
-                flow = "xtls-rprx-vision"
             if flow:
                 user["flow"] = flow
         else:
@@ -421,24 +487,16 @@ class XrayManager:
             "streamSettings": self._stream(profile),
         }
 
-        # Mux is only safe on plain TCP transports. It breaks
-        # xhttp/ws/grpc on many servers, so we only enable it for tcp.
-        network = params.get("type") or params.get("network") or "tcp"
-        if network == "tcp":
-            outbound["mux"] = {
-                "enabled": True,
-                "concurrency": 8,
-                "xudpConcurrency": 16,
-                "xudpProxyUDP443": "reject",
-            }
+        # Mux is intentionally NOT enabled: it stalls many servers and was a
+        # common source of timeouts. Hiddify/v2rayN also default to off.
 
         return {
             "log": {"loglevel": "warning"},
             "dns": {
                 "servers": [
                     {
-                        "address": "1.1.1.1",
-                        "domains": ["geosite:geolocation-!cn"],
+                        "address": "localhost",
+                        "domains": ["geosite:category-ir", "domain:ir"],
                     },
                     "1.1.1.1",
                     "8.8.8.8",
@@ -481,7 +539,7 @@ class XrayManager:
                 {"tag": "block", "protocol": "blackhole"},
             ],
             "routing": {
-                "domainStrategy": "IPIfNonMatch",
+                "domainStrategy": "AsIs",
                 "rules": [
                     {
                         "type": "field",
@@ -584,6 +642,10 @@ class XrayManager:
                 )
 
             try:
+                log_start = self.log_file.stat().st_size
+            except OSError:
+                log_start = 0
+            try:
                 log_handle = self.log_file.open("a", encoding="utf-8")
             except OSError:
                 log_handle = subprocess.DEVNULL
@@ -603,10 +665,55 @@ class XrayManager:
             except OSError as exc:
                 raise VPNError(f"Could not start Xray: {exc}") from exc
 
-            return True
+            self.local_port = int(local_port)
+            try:
+                self.pid_file.write_text(str(self.process.pid))
+            except OSError:
+                pass
+
+            # Wait until Xray really listens (or dies). Without this the
+            # first test ran before the port was open and "connected" was
+            # reported even when Xray had crashed a moment later.
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if self.process.poll() is not None:
+                    tail = self._log_since(log_start)
+                    self.process = None
+                    raise VPNError(
+                        "Xray exited right after start.\n\n"
+                        + (tail or "No log output — check the Xray binary and geo files.")
+                    )
+                try:
+                    socket.create_connection(("127.0.0.1", self.local_port), timeout=0.3).close()
+                    if self.use_system_proxy:
+                        self.set_system_proxy()
+                    return True
+                except OSError:
+                    time.sleep(0.15)
+
+            tail = self._log_since(log_start)
+            p = self.process
+            self.process = None
+            try:
+                p.terminate()
+            except OSError:
+                pass
+            raise VPNError(
+                f"Xray did not open local port {self.local_port} within 8s.\n\n"
+                + (tail or "")
+            )
+
+    def _log_since(self, offset: int, limit: int = 1200) -> str:
+        try:
+            with self.log_file.open("rb") as handle:
+                handle.seek(offset)
+                return handle.read().decode("utf-8", errors="replace").strip()[-limit:]
+        except OSError:
+            return ""
 
     def disconnect(self) -> None:
         """Terminate the running Xray process, if any."""
+        self.clear_system_proxy()
         with self._lock:
             p = self.process
             if not p:
@@ -622,6 +729,105 @@ class XrayManager:
                     except subprocess.TimeoutExpired:
                         pass
             self.process = None
+            try:
+                self.pid_file.unlink()
+            except OSError:
+                pass
+
+    # ------------------------------------------------------ system proxy
+
+    _WIN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    _BYPASS = ("localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2*;"
+               "172.30.*;172.31.*;192.168.*;<local>")
+
+    @staticmethod
+    def _win_refresh() -> None:
+        import ctypes
+        wininet = ctypes.windll.wininet
+        wininet.InternetSetOptionW(0, 39, 0, 0)  # SETTINGS_CHANGED
+        wininet.InternetSetOptionW(0, 37, 0, 0)  # REFRESH
+
+    def set_system_proxy(self) -> bool:
+        """Point the OS proxy at Xray's HTTP inbound (port + 1).
+
+        Windows: per-user Internet Settings (used by Chrome, Edge, Firefox
+        with 'use system proxy', most apps). Linux: GNOME gsettings.
+        The previous values are saved and restored by clear_system_proxy().
+        """
+        self.sysproxy_error = ""
+        host, port = "127.0.0.1", self.local_port + 1
+        try:
+            if os.name == "nt":
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._WIN_KEY, 0,
+                                    winreg.KEY_ALL_ACCESS) as key:
+                    if not self.sysproxy_file.exists():
+                        prev = {}
+                        for name in ("ProxyEnable", "ProxyServer", "ProxyOverride"):
+                            try:
+                                prev[name] = winreg.QueryValueEx(key, name)[0]
+                            except OSError:
+                                prev[name] = None
+                        self.sysproxy_file.write_text(json.dumps(prev), encoding="utf-8")
+                    winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
+                    winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, self._BYPASS)
+                    winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+                self._win_refresh()
+            elif shutil.which("gsettings"):
+                if not self.sysproxy_file.exists():
+                    mode = subprocess.run(
+                        ["gsettings", "get", "org.gnome.system.proxy", "mode"],
+                        capture_output=True, text=True, check=False).stdout.strip().strip("'")
+                    self.sysproxy_file.write_text(json.dumps({"mode": mode or "none"}), encoding="utf-8")
+                for schema in ("http", "https"):
+                    base = f"org.gnome.system.proxy.{schema}"
+                    subprocess.run(["gsettings", "set", base, "host", host], check=False)
+                    subprocess.run(["gsettings", "set", base, "port", str(port)], check=False)
+                subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"], check=False)
+            else:
+                self.sysproxy_error = "System proxy is not supported on this desktop."
+                return False
+            return True
+        except Exception as exc:  # registry/gsettings failures must not break connect
+            self.sysproxy_error = f"Could not set system proxy: {exc}"
+            return False
+
+    def clear_system_proxy(self) -> None:
+        """Restore the OS proxy settings saved by set_system_proxy()."""
+        if not self.sysproxy_file.exists():
+            return
+        try:
+            prev = json.loads(self.sysproxy_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prev = {}
+        try:
+            if os.name == "nt":
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._WIN_KEY, 0,
+                                    winreg.KEY_ALL_ACCESS) as key:
+                    for name, kind in (("ProxyServer", winreg.REG_SZ),
+                                       ("ProxyOverride", winreg.REG_SZ),
+                                       ("ProxyEnable", winreg.REG_DWORD)):
+                        old = prev.get(name)
+                        if old is None:
+                            try:
+                                winreg.DeleteValue(key, name)
+                            except OSError:
+                                pass
+                        else:
+                            winreg.SetValueEx(key, name, 0, kind, old)
+                    if prev.get("ProxyEnable") is None:
+                        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+                self._win_refresh()
+            elif shutil.which("gsettings"):
+                subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode",
+                                prev.get("mode", "none")], check=False)
+        except Exception:
+            pass
+        try:
+            self.sysproxy_file.unlink()
+        except OSError:
+            pass
 
     def connected(self) -> bool:
         return bool(self.process and self.process.poll() is None)
@@ -644,8 +850,9 @@ class XrayManager:
 
     # ----------------------------------------------------------- proxy I/O
 
-    def _open_socks(self, host: str, port: int, timeout: float = 5.0) -> socket.socket:
-        sock = socket.create_connection(("127.0.0.1", DEFAULT_SOCKS_PORT), timeout=timeout)
+    def _open_socks(self, host: str, port: int, timeout: float = 5.0,
+                    socks_port: int | None = None) -> socket.socket:
+        sock = socket.create_connection(("127.0.0.1", socks_port or self.local_port), timeout=timeout)
         sock.settimeout(timeout)
 
         sock.sendall(b"\x05\x01\x00")
@@ -673,59 +880,188 @@ class XrayManager:
 
     # ----------------------------------------------------------- verification
 
+    def _https_get(self, host: str, path: str, timeout: float = 8.0,
+                   socks_port: int | None = None,
+                   context: ssl.SSLContext | None = None) -> tuple[int, float]:
+        """GET https://host/path through the SOCKS tunnel -> (status, ms)."""
+        start = time.perf_counter()
+        sock = self._open_socks(host, 443, timeout=timeout, socks_port=socks_port)
+        try:
+            ctx = context or self._tls_context or ssl.create_default_context()
+            tls = ctx.wrap_socket(sock, server_hostname=host)
+            tls.settimeout(timeout)
+            tls.sendall(
+                f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+                f"User-Agent: Mozilla/5.0 CyberOpsSuite\r\nAccept: */*\r\n"
+                f"Connection: close\r\n\r\n".encode("ascii")
+            )
+            buf = b""
+            while b"\r\n" not in buf and len(buf) < 4096:
+                chunk = tls.recv(1024)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\r\n", 1)[0].decode("latin-1")
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].startswith("HTTP/") or not parts[1].isdigit():
+                raise OSError(f"bad response {line[:50]!r}")
+            return int(parts[1]), (time.perf_counter() - start) * 1000.0
+        finally:
+            sock.close()
+
     def test_connection(self, timeout: float = 8.0) -> tuple[bool, str]:
+        """Check that the tunnel really carries HTTPS traffic."""
         if not self.connected():
             return False, "Xray process is not running."
 
+        last = "No response."
+        for host, path in CHECK_URLS:
+            try:
+                status, ms = self._https_get(host, path, timeout=timeout)
+                if status < 500:
+                    return True, f"Connected — {host} answered {status} ({ms:.0f} ms)"
+                last = f"{host} returned HTTP {status}"
+            except socket.timeout:
+                last = "Proxy timeout — server did not respond."
+            except OSError as exc:
+                last = f"Proxy error: {exc}"
+            except Exception as exc:
+                last = f"Verification failed: {exc}"
+        return False, last
+
+    # ------------------------------------------------- per-profile site test
+
+    def test_profile_sites(self, profile: dict, executable: str = "",
+                           socks_port: int = 21080, sites=SITE_TESTS,
+                           timeout: float = 8.0,
+                           context: ssl.SSLContext | None = None) -> dict:
+        """Start a throw-away Xray for *profile* and open each site through it.
+
+        Runs on its own ports, so it never disturbs the active connection.
+        """
+        binary = self.find_xray(executable)
+        if not binary:
+            raise VPNError("Xray-core not found (see Locate xray).")
+
+        cfg_path = self.base_dir / f"test_{socks_port}.json"
+        log_path = self.base_dir / f"test_{socks_port}.log"
+        cfg_path.write_text(json.dumps(self.build_config(profile, socks_port)), encoding="utf-8")
+        result: dict[str, Any] = {
+            "id": profile.get("id"), "name": profile.get("name", "?"),
+            "error": "", "sites": {},
+        }
+        proc = None
         try:
-            start = time.perf_counter()
-            sock = self._open_socks(TRACE_HOST, TRACE_PORT, timeout=timeout)
-            http = (
-                f"GET {TRACE_PATH} HTTP/1.1\r\n"
-                f"Host: {TRACE_HOST}\r\n"
-                f"User-Agent: CyberOpsSuite/1.0\r\n"
-                f"Connection: close\r\n\r\n"
-            ).encode("ascii")
-            sock.sendall(http)
-
-            chunks: list[bytes] = []
-            total = 0
-            while total < 8192:
-                data = sock.recv(4096)
-                if not data:
+            with log_path.open("wb") as log:
+                proc = subprocess.Popen(
+                    [binary, "run", "-c", str(cfg_path)],
+                    stdout=log, stderr=subprocess.STDOUT, cwd=str(self.base_dir),
+                    **get_no_window_kwargs()
+                )
+            deadline = time.monotonic() + 8.0
+            ready = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
                     break
-                chunks.append(data)
-                total += len(data)
-            sock.close()
-
-            elapsed = (time.perf_counter() - start) * 1000.0
-            body = b"".join(chunks).decode("utf-8", errors="replace")
-
-            ip = ""
-            for line in body.splitlines():
-                if line.startswith("ip="):
-                    ip = line[3:].strip()
+                try:
+                    socket.create_connection(("127.0.0.1", socks_port), timeout=0.3).close()
+                    ready = True
                     break
+                except OSError:
+                    time.sleep(0.15)
+            if not ready:
+                try:
+                    tail = log_path.read_text(encoding="utf-8", errors="replace").strip()[-300:]
+                except OSError:
+                    tail = ""
+                result["error"] = tail or "Xray did not start."
+                return result
 
-            if not ip:
-                return False, "Tunnel responded but no IP in trace response."
+            for name, host, path in sites:
+                try:
+                    status, ms = self._https_get(host, path, timeout=timeout,
+                                                 socks_port=socks_port, context=context)
+                    result["sites"][name] = {
+                        "ok": status < 500 and status != 407,
+                        "status": status, "ms": round(ms),
+                    }
+                except socket.timeout:
+                    result["sites"][name] = {"ok": False, "error": "timeout"}
+                except Exception as exc:
+                    result["sites"][name] = {"ok": False, "error": str(exc)[:40]}
+            return result
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            for f in (cfg_path, log_path):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
-            return True, f"Connected — outbound IP: {ip} ({elapsed:.0f} ms)"
-        except socket.timeout:
-            return False, "Proxy timeout — server did not respond."
-        except OSError as exc:
-            return False, f"Proxy error: {exc}"
-        except Exception as exc:
-            return False, f"Verification failed: {exc}"
+    def test_all_profiles(self, profiles: list[dict], executable: str = "",
+                          jobs: int = 4, progress=None, **kwargs) -> list[dict]:
+        """Test every profile (parallel, own ports); best result first."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(item):
+            i, prof = item
+            try:
+                res = self.test_profile_sites(prof, executable,
+                                              socks_port=21080 + 2 * i, **kwargs)
+            except Exception as exc:
+                res = {"id": prof.get("id"), "name": prof.get("name", "?"),
+                       "error": str(exc), "sites": {}}
+            if progress:
+                try:
+                    progress(res)
+                except Exception:
+                    pass
+            return res
+
+        with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+            results = list(pool.map(one, enumerate(profiles)))
+
+        def key(r):
+            oks = [v for v in r["sites"].values() if v.get("ok")]
+            avg = sum(v["ms"] for v in oks) / len(oks) if oks else 1e9
+            return (-len(oks), avg)
+
+        return sorted(results, key=key)
+
+    @staticmethod
+    def format_site_results(results: list[dict]) -> str:
+        lines = []
+        for r in results:
+            sites = r.get("sites", {})
+            if r.get("error"):
+                lines.append(f"✗ 0/{len(SITE_TESTS)}  {r['name']}  —  {r['error'][:80]}")
+                continue
+            oks = sum(1 for v in sites.values() if v.get("ok"))
+            parts = []
+            for name, v in sites.items():
+                parts.append(f"{name} {v['status']} {v['ms']}ms" if v.get("ok")
+                             else f"{name} ✗ {v.get('error', v.get('status', '?'))}")
+            mark = "✓" if oks == len(sites) and sites else ("~" if oks else "✗")
+            lines.append(f"{mark} {oks}/{len(sites)}  {r['name']}  —  " + "  |  ".join(parts))
+        return "\n".join(lines)
 
     # ----------------------------------------------------------- speed test
+
+    def _open_tls(self, timeout: float):
+        sock = self._open_socks(SPEED_HOST, SPEED_PORT, timeout=timeout)
+        ctx = ssl.create_default_context()
+        return ctx.wrap_socket(sock, server_hostname=SPEED_HOST)
 
     def measure_down_speed(self, duration: float = 3.0) -> float:
         if not self.connected():
             return 0.0
-
         try:
-            sock = self._open_socks(SPEED_HOST, 80, timeout=5.0)
+            sock = self._open_tls(5.0)
             sock.settimeout(duration + 3.0)
             sock.sendall(
                 f"GET {SPEED_DOWN_PATH} HTTP/1.1\r\n"
@@ -733,9 +1069,20 @@ class XrayManager:
                 f"User-Agent: CyberOpsSuite/1.0\r\n"
                 f"Connection: close\r\n\r\n".encode("ascii")
             )
+            # Read headers first so they are not counted as payload.
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 16384:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                head += chunk
+            header, _, body = head.partition(b"\r\n\r\n")
+            if b" 200" not in header.split(b"\r\n", 1)[0]:
+                sock.close()
+                return 0.0
 
             start = time.perf_counter()
-            total = 0
+            total = len(body)
             while time.perf_counter() - start < duration:
                 try:
                     data = sock.recv(65536)
@@ -746,7 +1093,6 @@ class XrayManager:
                 total += len(data)
             elapsed = time.perf_counter() - start
             sock.close()
-
             if elapsed <= 0:
                 return 0.0
             return (total * 8) / (elapsed * 1_000_000)
@@ -756,11 +1102,9 @@ class XrayManager:
     def measure_up_speed(self, duration: float = 3.0) -> float:
         if not self.connected():
             return 0.0
-
         try:
-            sock = self._open_socks(SPEED_HOST, 80, timeout=5.0)
+            sock = self._open_tls(5.0)
             sock.settimeout(duration + 3.0)
-
             chunk = b"x" * 65536
             total_bytes = 8 * 1024 * 1024
             sock.sendall(
@@ -770,7 +1114,6 @@ class XrayManager:
                 f"Content-Length: {total_bytes}\r\n"
                 f"Connection: close\r\n\r\n".encode("ascii")
             )
-
             start = time.perf_counter()
             sent = 0
             while sent < total_bytes and time.perf_counter() - start < duration:
@@ -779,7 +1122,6 @@ class XrayManager:
                 sent += to_send
             elapsed = time.perf_counter() - start
             sock.close()
-
             if elapsed <= 0:
                 return 0.0
             return (sent * 8) / (elapsed * 1_000_000)

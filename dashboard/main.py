@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import platform
+import importlib.util
 import queue
 import subprocess
 import sys
@@ -52,7 +53,7 @@ except ImportError:
     HAS_SERVER_MONITOR = False
 
 
-APP_VERSION = "1.5.7"
+APP_VERSION = "1.5.8"
 
 TOOLS = [
     ("🛡", "Firewall Manager",
@@ -70,6 +71,9 @@ TOOLS = [
     ("🖥", "Server Monitor",
      "Monitor local service health on Windows and Linux.",
      "server_monitor.gui.main", "INFRASTRUCTURE", "#A855F7"),
+    ("🛡", "ThreatGuard",
+     "Scan files and review local security posture.",
+     "threat_guard.gui.main", "ENDPOINT SECURITY", "#10B981"),
     ("🔒", "VPN Manager",
      "Manage VLESS/VMess profiles and the local Xray proxy.",
      "vpn_manager.gui.main", "VPN CONNECTIVITY", "#06B6D4"),
@@ -84,6 +88,7 @@ MODULE_TO_EXE = {
     "network_mapper.gui.main": "NetworkMapper",
     "dhcp_lease_viewer.gui.main": "DHCPLeaseViewer",
     "server_monitor.gui.main": "ServerMonitor",
+    "threat_guard.gui.main": "ThreatGuard",
     "vpn_manager.gui.main": "VPNManager",
     "ip_rotator.gui.main": "IPRotator",
 }
@@ -257,6 +262,7 @@ class Dashboard(ctk.CTk):
         shortcuts = [
             ("🛡  Firewall", "firewall_manager.gui.main"),
             ("🖥  Server", "server_monitor.gui.main"),
+            ("🛡  ThreatGuard", "threat_guard.gui.main"),
             ("🗺  Network", "network_mapper.gui.main"),
             ("🌐  IP Rotator", "ip_rotator.gui.main"),
         ]
@@ -620,17 +626,17 @@ class Dashboard(ctk.CTk):
     # ===================================================== background stats
 
     def _start_background_stats(self) -> None:
-        self._poll_after_id = self.after(200, self._poll_stats)
+        self._poll_after_id = self.after(500, self._poll_stats)
         self._refresh_ip_stats()
         self._refresh_firewall_stats()
         self._refresh_service_stats()
         self._load_last_scan()
-        self.after(30_000, self._periodic_refresh)
+        self.after(60_000, self._periodic_refresh)
 
     def _periodic_refresh(self):
         self._refresh_firewall_stats()
         self._refresh_service_stats()
-        self.after(30_000, self._periodic_refresh)
+        self.after(60_000, self._periodic_refresh)
 
     def _refresh_ip_stats(self) -> None:
         def worker():
@@ -640,11 +646,9 @@ class Dashboard(ctk.CTk):
                     logger = IPLogger()
                     ip = logger.get_real_ip()
                 else:
-                    import urllib.request
-                    with urllib.request.urlopen(
-                        "https://api.ipify.org?format=text", timeout=5
-                    ) as r:
-                        ip = r.read().decode("utf-8").strip()
+                    # Keep the dashboard lightweight and avoid an unsolicited
+                    # external request when the optional IP logger is absent.
+                    ip = "N/A"
             except Exception:
                 ip = "Offline"
             self._stats_queue.put(("ip", ip))
@@ -724,7 +728,7 @@ class Dashboard(ctk.CTk):
 
         try:
             if self.winfo_exists():
-                self._poll_after_id = self.after(200, self._poll_stats)
+                self._poll_after_id = self.after(500, self._poll_stats)
         except Exception:
             pass
 
@@ -1104,9 +1108,34 @@ class Dashboard(ctk.CTk):
                 )
                 return
 
+        log_handle = None
+        log_path = None
         try:
-            subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
+            log_handle = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".log",
+                prefix="cyberopssuite_", delete=False,
+            )
+            log_path = log_handle.name
+            process = subprocess.Popen(
+                [str(exe_path)],
+                cwd=str(exe_path.parent),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+            log_handle.close()
+            log_handle = None
+            self.after(
+                2500,
+                lambda: self._check_module_startup(process, exe_base, log_path),
+            )
         except (OSError, subprocess.SubprocessError) as exc:
+            if log_handle is not None:
+                log_handle.close()
+            if log_path and os.path.exists(log_path):
+                try:
+                    os.remove(log_path)
+                except OSError:
+                    pass
             messagebox.showerror(
                 "Unable to launch module",
                 f"Could not start {exe_base}.exe\n\nDetails: {exc}",
@@ -1190,12 +1219,22 @@ class Dashboard(ctk.CTk):
             except OSError:
                 pass
 
+        code = process.returncode
         if not details:
-            details = "The module process closed immediately without printing an error."
+            details = (
+                "The module process closed immediately without printing an error "
+                f"(exit code {code})."
+            )
+        elif code not in (None, 0):
+            details = f"{details}\n\n(exit code {code})"
+
+        # A clean, quick exit with output is not necessarily a failure.
+        if code == 0 and details and "Traceback" not in details:
+            return
 
         messagebox.showerror(
             "Module did not start",
-            f"{module_name} exited during startup.\n\n{details}",
+            f"{module_name} exited during startup.\n\n{details[-3000:]}",
             parent=self,
         )
 

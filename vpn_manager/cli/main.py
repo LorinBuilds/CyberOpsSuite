@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the Xray executable (default: bin/xray)",
     )
 
+    tst = sub.add_parser("test", help="Test every profile against YouTube/Instagram/X/Telegram")
+    tst.add_argument("--xray", default="", help="Path to the Xray executable")
+    tst.add_argument("--jobs", type=int, default=4, help="Parallel tests (default 4)")
+
     sub.add_parser("disconnect", help="Stop the running Xray process")
     sub.add_parser("status", help="Show the current connection status")
 
@@ -147,6 +151,19 @@ def main(argv: list[str] | None = None) -> int:
                 except KeyboardInterrupt:
                     print("\nStopping…")
             return 0 if ok else 2
+
+        if args.command == "test":
+            if not manager.profiles:
+                print("No profiles yet.")
+                return 1
+            print(f"Testing {len(manager.profiles)} profile(s)…")
+            results = manager.test_all_profiles(
+                manager.profiles, args.xray, jobs=args.jobs,
+                progress=lambda r: print(f"  done: {r['name']}", flush=True),
+            )
+            print()
+            print(manager.format_site_results(results))
+            return 0
 
         if args.command == "disconnect":
             manager.disconnect()

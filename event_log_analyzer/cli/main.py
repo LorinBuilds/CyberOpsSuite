@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import io
 import sys
+import time
 from collections.abc import Sequence
 
 from event_log_analyzer import __version__
 from event_log_analyzer.core.exporters import entries_to_json, write_csv
 from event_log_analyzer.core.filters import filter_entries
 from event_log_analyzer.core.levels import FILTER_LEVELS
+from event_log_analyzer.core.linux_events import SYSTEM_JOURNALS, JournalError, read_linux_journal
+from event_log_analyzer.core.listeners import AllowListError, parse_allow_list
+from event_log_analyzer.core.netflow_events import DEFAULT_NETFLOW_PORT, NetFlowListener
 from event_log_analyzer.core.parser import LogEntry, LogParser
+from event_log_analyzer.core.syslog_events import DEFAULT_SYSLOG_PORT, SyslogListener
 from event_log_analyzer.core.windows_events import (
     MAX_EVENTS,
     MIN_EVENTS,
@@ -24,7 +29,10 @@ from event_log_analyzer.core.windows_events import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="event-log-analyzer",
-        description="Parse, filter and search JSON Lines log files or local Windows event logs.",
+        description=(
+            "Parse, filter and search JSON Lines log files, local Windows event logs, "
+            "the Linux journal, or live Syslog / NetFlow traffic."
+        ),
     )
     parser.add_argument(
         "file",
@@ -38,10 +46,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read a local Windows event log instead of a file: " + ", ".join(SYSTEM_LOGS),
     )
     parser.add_argument(
+        "--linux",
+        metavar="LOG",
+        choices=SYSTEM_JOURNALS,
+        help="Read the local systemd journal instead of a file: " + ", ".join(SYSTEM_JOURNALS),
+    )
+    parser.add_argument(
+        "--listen",
+        choices=("syslog", "netflow"),
+        help="Capture live network events over UDP (Syslog or NetFlow v5)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help=f"UDP port for --listen (default: {DEFAULT_SYSLOG_PORT} syslog, {DEFAULT_NETFLOW_PORT} netflow)",
+    )
+    parser.add_argument(
+        "--allow",
+        default="",
+        metavar="IPS",
+        help="Comma-separated sender IPs accepted by --listen (default: all)",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=30,
+        help="Seconds to capture with --listen; 0 = until Ctrl+C (default: 30)",
+    )
+    parser.add_argument(
         "--max-events",
         type=int,
         default=300,
-        help=f"Events to request with --windows ({MIN_EVENTS}-{MAX_EVENTS}, default: 300)",
+        help=f"Events to request with --windows / --linux ({MIN_EVENTS}-{MAX_EVENTS}, default: 300)",
     )
     parser.add_argument(
         "--level",
@@ -101,14 +137,47 @@ def render(entries: Sequence[LogEntry], total: int, fmt: str) -> str:
     return render_text(entries, total)
 
 
+def capture_network(
+    kind: str, port: int | None, allow: set[str], duration: int
+) -> tuple[list[LogEntry], object]:
+    """Listen for *duration* seconds (0 = until Ctrl+C) and return the events."""
+    if kind == "syslog":
+        listener = SyslogListener(port=port or DEFAULT_SYSLOG_PORT, allow_ips=allow)
+    else:
+        listener = NetFlowListener(port=port or DEFAULT_NETFLOW_PORT, allow_ips=allow)
+    listener.start()  # RuntimeError with a readable message if the port is busy
+    limit = f"{duration} s" if duration else "Ctrl+C"
+    print(
+        f"Listening for {kind} on UDP {listener.port} (stops after {limit})...",
+        file=sys.stderr,
+    )
+    entries: list[LogEntry] = []
+    deadline = time.monotonic() + duration if duration else None
+    try:
+        while deadline is None or time.monotonic() < deadline:
+            time.sleep(0.2)
+            entries.extend(listener.drain(10000))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()
+        entries.extend(listener.drain(10000))
+    return entries, listener.stats
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.limit < 0:
         parser.error("--limit cannot be negative")
-    if bool(args.file) == bool(args.windows):
-        parser.error("provide either a log FILE or --windows LOG (not both)")
+    sources = [bool(args.file), bool(args.windows), bool(args.linux), bool(args.listen)]
+    if sum(sources) != 1:
+        parser.error("provide exactly one source: a log FILE, --windows LOG, --linux LOG or --listen KIND")
+    if args.duration < 0:
+        parser.error("--duration cannot be negative")
+    if args.port is not None and not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
 
     # Never crash on consoles that cannot print some characters found in logs.
     if hasattr(sys.stdout, "reconfigure"):
@@ -118,11 +187,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.windows:
             entries = read_windows_events(args.windows, args.max_events)
+        elif args.linux:
+            entries = read_linux_journal(args.linux, args.max_events)
+        elif args.listen:
+            entries, stats = capture_network(
+                args.listen, args.port, parse_allow_list(args.allow), args.duration
+            )
+            print(
+                f"Captured {stats.events} events ({stats.packets} packets, "
+                f"{stats.rejected} rejected, {stats.malformed} malformed, "
+                f"{stats.unsupported} unsupported).",
+                file=sys.stderr,
+            )
         else:
             log_parser = LogParser(args.file)
             entries = log_parser.parse()
             issues = log_parser.errors
-    except (OSError, ValueError, EventLogError) as exc:
+    except (OSError, ValueError, RuntimeError, EventLogError, JournalError, AllowListError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
