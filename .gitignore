@@ -99,4 +99,9 @@ htmlcov/
 # ==========================================
 # Local-only files
 # ==========================================
-clean.bat
+clean.bat*.pyc
+*.pyo
+*.pyd
+exports/
+*.pid
+data/vpn_manager/profiles.json
