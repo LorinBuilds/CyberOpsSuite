@@ -52,7 +52,7 @@ INSTALLER_ISS = PROJECT_ROOT / "installer.iss"
 OPTIONS = {
     "console": False,
     "admin": True,
-    "version": "1.0.0",
+    "version": "1.1.0.0",
     "build_installer": True,
 }
 
@@ -775,7 +775,7 @@ def main() -> int:
         OPTIONS["version"] = _normalize_version(args.version)
     else:
         file_ver = _read_version_file()
-        OPTIONS["version"] = _normalize_version(file_ver or "1.0.0")
+        OPTIONS["version"] = _normalize_version(file_ver or "1.1.0.0")
 
     if args.skip_installer:
         OPTIONS["build_installer"] = False
